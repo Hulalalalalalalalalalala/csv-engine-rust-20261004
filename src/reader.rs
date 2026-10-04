@@ -1842,6 +1842,9 @@ impl<R: io::Read + io::Seek> Reader<R> {
         }
         self.rdr.seek(io::SeekFrom::Start(pos.byte()))?;
         self.core.reset();
+        // A BOM is only meaningful at the very start of the stream. Seeking
+        // to a non-zero record offset must preserve a BOM-like sequence there.
+        self.core.set_strip_bom(pos.byte() == 0);
         self.core.set_line(pos.line());
         self.state.cur_pos = pos;
         self.state.eof = ReaderEofState::NotEof;
@@ -1870,6 +1873,9 @@ impl<R: io::Read + io::Seek> Reader<R> {
         self.state.seeked = true;
         self.rdr.seek(seek_from)?;
         self.core.reset();
+        // A BOM is only meaningful at the very start of the stream. Seeking
+        // to a non-zero record offset must preserve a BOM-like sequence there.
+        self.core.set_strip_bom(pos.byte() == 0);
         self.core.set_line(pos.line());
         self.state.cur_pos = pos;
         self.state.eof = ReaderEofState::NotEof;

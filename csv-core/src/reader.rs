@@ -122,10 +122,52 @@ pub struct Reader {
     use_nfa: bool,
     /// The current line number.
     line: u64,
-    /// Whether this parser has ever read anything.
-    has_read: bool,
+    /// The state of UTF-8 BOM detection at the start of the stream.
+    bom: Bom,
     /// The current position in the output buffer when reading a record.
     output_pos: usize,
+}
+
+/// The bytes of a UTF-8 byte order mark.
+const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// The phase of UTF-8 BOM detection at the start of a stream.
+///
+/// A BOM is only recognized when it is the first thing in a stream, so
+/// detection is active only for a fresh reader (or after a call to `reset`).
+/// The BOM may arrive split across several caller-provided buffers, so the
+/// detector remembers any unmatched prefix. If the BOM is ruled out (either
+/// because a byte does not match or because the stream ended early), the
+/// candidate bytes are fed to the parser as ordinary data instead of being
+/// swallowed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Bom {
+    /// Detection is in progress and `0`, `1` or `2` leading BOM bytes have
+    /// been observed and held back from the parser.
+    Check(u8),
+    /// The BOM was ruled out and the held candidate bytes, a slice of
+    /// `BOM[start..end]`, still need to be replayed to the parser as ordinary
+    /// data.
+    Replay(u8, u8),
+    /// BOM detection has finished (the BOM was found and removed, it was
+    /// ruled out, detection was disabled, or all held bytes were replayed).
+    Done,
+}
+
+/// The outcome of advancing BOM detection over one caller chunk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BomStep {
+    /// Every byte of the chunk extended the still-incomplete BOM candidate;
+    /// they were absorbed and must not reach the parser yet.
+    Hold,
+    /// A complete BOM was formed using this many bytes of the chunk; those
+    /// bytes are removed.
+    Strip(usize),
+    /// A byte did not match the BOM. The first `consumed` bytes of the chunk
+    /// (together with bytes held by earlier reads) are ordinary data queued
+    /// for replay; the mismatch byte and everything after it remain in the
+    /// caller's input.
+    Mismatch { consumed: usize },
 }
 
 impl Default for Reader {
@@ -143,7 +185,7 @@ impl Default for Reader {
             quoting: true,
             use_nfa: false,
             line: 1,
-            has_read: false,
+            bom: Bom::Check(0),
             output_pos: 0,
         }
     }
@@ -483,8 +525,22 @@ impl Reader {
         self.dfa_state = self.dfa.new_state(NfaState::StartRecord);
         self.nfa_state = NfaState::StartRecord;
         self.line = 1;
-        self.has_read = false;
+        self.bom = Bom::Check(0);
         self.output_pos = 0;
+    }
+
+    /// Enable or disable automatic stripping of a UTF-8 BOM.
+    ///
+    /// When enabled (the default), a BOM appearing at the very start of the
+    /// data is detected and removed. Stripping is always re-enabled by
+    /// [`reset`](Reader::reset). When disabled, the bytes `\xEF\xBB\xBF`
+    /// are treated as ordinary data even at the start of the stream.
+    ///
+    /// This is useful when reusing a parser to read from a position that is
+    /// known not to be the start of a stream: a BOM-like sequence at that
+    /// position must be preserved.
+    pub fn set_strip_bom(&mut self, yes: bool) {
+        self.bom = if yes { Bom::Check(0) } else { Bom::Done };
     }
 
     /// Return the current line number as measured by the number of occurrences
@@ -537,14 +593,82 @@ impl Reader {
         input: &[u8],
         output: &mut [u8],
     ) -> (ReadFieldResult, usize, usize) {
-        let (input, bom_nin) = self.strip_utf8_bom(input);
-        let (res, nin, nout) = if self.use_nfa {
+        let mut nin = 0;
+        let mut nout = 0;
+        // `data` is the caller input that reaches the parser once BOM
+        // detection is accounted for.
+        let mut data: &[u8] = input;
+        if let Bom::Check(held) = self.bom {
+            if input.is_empty() {
+                // End of stream: a held prefix is ordinary data, not a BOM.
+                self.bom =
+                    if held == 0 { Bom::Done } else { Bom::Replay(0, held) };
+            } else {
+                match self.bom_detect(input) {
+                    // The whole chunk is an undecided prefix of the BOM.
+                    BomStep::Hold => {
+                        return (ReadFieldResult::InputEmpty, input.len(), 0)
+                    }
+                    // A complete BOM ended within this chunk.
+                    BomStep::Strip(skip) => {
+                        nin = skip;
+                        data = &input[skip..];
+                    }
+                    // A byte ruled the BOM out. The candidate bytes (the held
+                    // prefix followed by this call's matching run) are queued
+                    // for replay; the rest of the chunk is ordinary data.
+                    BomStep::Mismatch { consumed } => {
+                        nin = consumed;
+                        data = &input[consumed..];
+                    }
+                }
+            }
+        }
+        // Replay candidate bytes now known not to be a BOM. They never count
+        // toward `nin` of this call.
+        if let Bom::Replay(a, b) = self.bom {
+            let (mut start, end) = (a as usize, b as usize);
+            loop {
+                if start >= end {
+                    self.bom = Bom::Done;
+                    break;
+                }
+                let (res, rn, on) = self
+                    .read_field_once(&BOM[start..end], &mut output[nout..]);
+                start += rn;
+                nout += on;
+                match res {
+                    ReadFieldResult::InputEmpty => continue,
+                    _ => {
+                        self.bom = Bom::Replay(start as u8, end as u8);
+                        return (res, nin, nout);
+                    }
+                }
+            }
+        }
+        // A non-empty chunk that consisted of exactly the confirmed BOM
+        // produces an empty data slice but must not trigger the final
+        // transition; the caller signals real end of stream with an empty
+        // input.
+        if !input.is_empty() && data.is_empty() {
+            return (ReadFieldResult::InputEmpty, nin, nout);
+        }
+        let (res, rn, on) = self.read_field_once(data, &mut output[nout..]);
+        (res, nin + rn, nout + on)
+    }
+
+    /// Dispatch a single chunk to either the NFA or DFA field parser.
+    #[inline(always)]
+    fn read_field_once(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> (ReadFieldResult, usize, usize) {
+        if self.use_nfa {
             self.read_field_nfa(input, output)
         } else {
             self.read_field_dfa(input, output)
-        };
-        self.has_read = true;
-        (res, nin + bom_nin, nout)
+        }
     }
 
     /// Parse a single CSV record in `input` and copy each field contiguously
@@ -594,27 +718,140 @@ impl Reader {
         output: &mut [u8],
         ends: &mut [usize],
     ) -> (ReadRecordResult, usize, usize, usize) {
-        let (input, bom_nin) = self.strip_utf8_bom(input);
-        let (res, nin, nout, nend) = if self.use_nfa {
+        let mut nin = 0;
+        let mut nout = 0;
+        let mut nend = 0;
+        // `data` is the caller input that reaches the parser once BOM
+        // detection is accounted for.
+        let mut data: &[u8] = input;
+        if let Bom::Check(held) = self.bom {
+            if input.is_empty() {
+                // End of stream: a held prefix is ordinary data, not a BOM.
+                self.bom =
+                    if held == 0 { Bom::Done } else { Bom::Replay(0, held) };
+            } else {
+                match self.bom_detect(input) {
+                    // The whole chunk is an undecided prefix of the BOM.
+                    BomStep::Hold => {
+                        return (
+                            ReadRecordResult::InputEmpty,
+                            input.len(),
+                            0,
+                            0,
+                        )
+                    }
+                    // A complete BOM ended within this chunk.
+                    BomStep::Strip(skip) => {
+                        nin = skip;
+                        data = &input[skip..];
+                    }
+                    // A byte ruled the BOM out. The candidate bytes are queued
+                    // for replay; the rest of the chunk is ordinary data.
+                    BomStep::Mismatch { consumed } => {
+                        nin = consumed;
+                        data = &input[consumed..];
+                    }
+                }
+            }
+        }
+        // Replay candidate bytes now known not to be a BOM. They never count
+        // toward `nin` of this call.
+        if let Bom::Replay(a, b) = self.bom {
+            let (mut start, end) = (a as usize, b as usize);
+            loop {
+                if start >= end {
+                    self.bom = Bom::Done;
+                    break;
+                }
+                let (res, rn, on, en) = self.read_record_once(
+                    &BOM[start..end],
+                    &mut output[nout..],
+                    &mut ends[nend..],
+                );
+                start += rn;
+                nout += on;
+                nend += en;
+                match res {
+                    ReadRecordResult::InputEmpty => continue,
+                    _ => {
+                        self.bom = Bom::Replay(start as u8, end as u8);
+                        return (res, nin, nout, nend);
+                    }
+                }
+            }
+        }
+        // A non-empty chunk that consisted of exactly the confirmed BOM
+        // produces an empty data slice but must not trigger the final
+        // transition; the caller signals real end of stream with an empty
+        // input.
+        if !input.is_empty() && data.is_empty() {
+            return (ReadRecordResult::InputEmpty, nin, nout, nend);
+        }
+        let (res, rn, on, en) = self.read_record_once(
+            data,
+            &mut output[nout..],
+            &mut ends[nend..],
+        );
+        (res, nin + rn, nout + on, nend + en)
+    }
+
+    /// Dispatch a single chunk to either the NFA or DFA record parser.
+    #[inline(always)]
+    fn read_record_once(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        ends: &mut [usize],
+    ) -> (ReadRecordResult, usize, usize, usize) {
+        if self.use_nfa {
             self.read_record_nfa(input, output, ends)
         } else {
             self.read_record_dfa(input, output, ends)
-        };
-        self.has_read = true;
-        (res, nin + bom_nin, nout, nend)
+        }
     }
 
-    /// Strip off a possible UTF-8 BOM at the start of a file. Quick note that
-    /// this method will fail to strip off the BOM if only part of the BOM is
-    /// buffered. Hopefully that won't happen very often.
-    fn strip_utf8_bom<'a>(&self, input: &'a [u8]) -> (&'a [u8], usize) {
-        if !self.has_read
-            && input.len() >= 3
-            && &input[0..3] == b"\xef\xbb\xbf"
+    /// Advance BOM detection over the caller's chunk.
+    ///
+    /// On entry `self.bom` is `Bom::Check(held)` with `held` candidate bytes
+    /// already absorbed from earlier reads, and `input` is non-empty. The
+    /// returned step describes what happened:
+    ///
+    /// * `Hold` — every byte of `input` extends the candidate prefix, which is
+    ///   still shorter than the BOM. All bytes are consumed.
+    /// * `Strip(n)` — the candidate plus the first `n` bytes is the complete
+    ///   BOM. Those `n` bytes are consumed and removed.
+    /// * `Mismatch { consumed }` — `input[consumed]` is the first byte that
+    ///   does not match. The `consumed` matching bytes, together with the
+    ///   previously held prefix, are queued in `Bom::Replay` and must be fed
+    ///   back to the parser as ordinary data; the mismatch byte and the rest
+    ///   of the chunk stay in the caller's input.
+    #[inline(always)]
+    fn bom_detect(&mut self, input: &[u8]) -> BomStep {
+        let held = match self.bom {
+            Bom::Check(h) => h as usize,
+            _ => unreachable!(),
+        };
+        let mut i = 0;
+        while held + i < BOM.len()
+            && i < input.len()
+            && input[i] == BOM[held + i]
         {
-            (&input[3..], 3)
+            i += 1;
+        }
+        let matched = held + i;
+        if matched == BOM.len() {
+            self.bom = Bom::Done;
+            BomStep::Strip(i)
+        } else if i == input.len() {
+            self.bom = Bom::Check(matched as u8);
+            BomStep::Hold
+        } else if matched == 0 {
+            // The very first byte rules the BOM out; nothing to replay.
+            self.bom = Bom::Done;
+            BomStep::Mismatch { consumed: 0 }
         } else {
-            (input, 0)
+            self.bom = Bom::Replay(0, matched as u8);
+            BomStep::Mismatch { consumed: i }
         }
     }
 
@@ -877,7 +1114,7 @@ impl Reader {
         if ends.is_empty() {
             return (ReadRecordResult::OutputEndsFull, 0, 0, 0);
         }
-        let (mut nin, mut nout, mut nend) = (0, self.output_pos, 0);
+        let (mut nin, mut nout, mut nend) = (0, 0, 0);
         let mut state = self.nfa_state;
         while nin < input.len() && nout < output.len() && nend < ends.len() {
             let (s, io) = self.transition_nfa(state, input[nin]);
@@ -894,7 +1131,7 @@ impl Reader {
             }
             state = s;
             if state.is_field_final() {
-                ends[nend] = nout;
+                ends[nend] = self.output_pos + nout;
                 nend += 1;
                 if state != NfaState::EndFieldDelim {
                     break;
@@ -908,7 +1145,8 @@ impl Reader {
             nend >= ends.len(),
         );
         self.nfa_state = state;
-        self.output_pos = if res.is_record() { 0 } else { nout };
+        self.output_pos =
+            if res.is_record() { 0 } else { self.output_pos + nout };
         (res, nin, nout, nend)
     }
 
