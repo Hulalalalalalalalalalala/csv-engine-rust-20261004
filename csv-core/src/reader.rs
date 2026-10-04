@@ -122,10 +122,28 @@ pub struct Reader {
     use_nfa: bool,
     /// The current line number.
     line: u64,
-    /// Whether this parser has ever read anything.
-    has_read: bool,
     /// The current position in the output buffer when reading a record.
     output_pos: usize,
+    /// The number of leading bytes already seen that match a prefix of the
+    /// UTF-8 BOM signature (`EF BB BF`). Only bytes from position `0` of the
+    /// logical input stream are considered, and only while `bom_checking` is
+    /// true. A matching third byte confirms and strips the BOM; any other
+    /// byte releases the retained prefix as ordinary data.
+    bom_len: usize,
+    /// Whether BOM detection is still in progress. This starts out true, is
+    /// re-enabled by `reset`, and is permanently disabled once the BOM is
+    /// stripped or ruled out. Callers that begin parsing at a non-zero byte
+    /// offset (such as a CSV reader after a seek) disable it explicitly.
+    bom_checking: bool,
+    /// Bytes that the BOM stage has accepted from the caller but not yet been
+    /// able to hand to the parser because the caller's output buffer(s) were
+    /// too small. These are either a released BOM prefix (a mismatch with the
+    /// `EF BB BF` signature) or ordinary data that followed the signature
+    /// while a complete BOM was being confirmed. At most `3` bytes can be
+    /// staged: a two byte candidate prefix plus the mismatching byte.
+    bom_data: [u8; 3],
+    /// The number of valid bytes in `bom_data`.
+    bom_data_len: usize,
 }
 
 impl Default for Reader {
@@ -143,8 +161,11 @@ impl Default for Reader {
             quoting: true,
             use_nfa: false,
             line: 1,
-            has_read: false,
             output_pos: 0,
+            bom_len: 0,
+            bom_checking: true,
+            bom_data: [0; 3],
+            bom_data_len: 0,
         }
     }
 }
@@ -479,12 +500,39 @@ impl Reader {
     /// Reset the parser such that it behaves as if it had never been used.
     ///
     /// This may be useful when reading CSV data in a random access pattern.
+    ///
+    /// Resetting re-enables detection of a UTF-8 BOM at the beginning of the
+    /// next input stream. If the parser is reset in order to begin reading at
+    /// a non-zero byte offset (such as after a seek), then BOM detection
+    /// should be disabled with `set_bom_checking(false)`.
     pub fn reset(&mut self) {
         self.dfa_state = self.dfa.new_state(NfaState::StartRecord);
         self.nfa_state = NfaState::StartRecord;
         self.line = 1;
-        self.has_read = false;
         self.output_pos = 0;
+        self.bom_len = 0;
+        self.bom_checking = true;
+        self.bom_data_len = 0;
+    }
+
+    /// Enable or disable detection of a UTF-8 BOM at the start of the input.
+    ///
+    /// BOM detection is enabled by freshly built parsers and immediately
+    /// after a call to
+    /// [`Reader::reset`](struct.Reader.html#method.reset). When enabled, the
+    /// parser removes exactly one UTF-8 BOM (`EF BB BF`) occurring at byte
+    /// position `0` of the input; the same bytes occurring anywhere else are
+    /// preserved as ordinary data.
+    ///
+    /// Callers that reset the parser in order to read from a non-zero byte
+    /// offset should disable BOM detection, otherwise a record that happens
+    /// to begin with the same three bytes would be mangled. This is intended
+    /// to be called immediately after `reset`; calling it while a partial BOM
+    /// prefix is buffered discards that prefix.
+    pub fn set_bom_checking(&mut self, yes: bool) {
+        self.bom_checking = yes;
+        self.bom_len = 0;
+        self.bom_data_len = 0;
     }
 
     /// Return the current line number as measured by the number of occurrences
@@ -537,14 +585,62 @@ impl Reader {
         input: &[u8],
         output: &mut [u8],
     ) -> (ReadFieldResult, usize, usize) {
-        let (input, bom_nin) = self.strip_utf8_bom(input);
-        let (res, nin, nout) = if self.use_nfa {
-            self.read_field_nfa(input, output)
+        let mut nout_total = 0;
+
+        // Advance BOM detection. `rest` is the portion of this call's input
+        // still owed to the parser; any prefix bytes retained for detection
+        // were counted as consumed in the call that received them.
+        let rest = self.bom_detect(input);
+        let nin_total = input.len() - rest.len();
+
+        // A prefix that turned out not to be a BOM (or was left dangling when
+        // the caller signalled end) must now be parsed as ordinary data.
+        let mut staged = [0u8; 3];
+        let staged_len = self.bom_data_len;
+        staged[..staged_len].copy_from_slice(&self.bom_data[..staged_len]);
+        if staged_len > 0 {
+            let (res, c, nout) = if self.use_nfa {
+                self.read_field_nfa(
+                    &staged[..staged_len],
+                    &mut output[nout_total..],
+                )
+            } else {
+                self.read_field_dfa(
+                    &staged[..staged_len],
+                    &mut output[nout_total..],
+                )
+            };
+            self.bom_consume_staged(c);
+            nout_total += nout;
+            // Stop while staged bytes remain: `rest` belongs after them and
+            // must not be parsed (nor consumed) out of order.
+            if res != ReadFieldResult::InputEmpty || c < staged_len {
+                return (res, nin_total, nout_total);
+            }
+        }
+
+        if !rest.is_empty() {
+            let (res, c, nout) = if self.use_nfa {
+                self.read_field_nfa(rest, &mut output[nout_total..])
+            } else {
+                self.read_field_dfa(rest, &mut output[nout_total..])
+            };
+            (res, nin_total + c, nout_total + nout)
+        } else if input.is_empty() {
+            // Only a genuinely empty input from the caller may advance the
+            // parser into its final state. A non-empty chunk that consisted
+            // solely of BOM bytes must not be mistaken for end of input.
+            let (res, _, nout) = if self.use_nfa {
+                self.read_field_nfa(&[], &mut output[nout_total..])
+            } else {
+                self.read_field_dfa(&[], &mut output[nout_total..])
+            };
+            (res, 0, nout_total + nout)
         } else {
-            self.read_field_dfa(input, output)
-        };
-        self.has_read = true;
-        (res, nin + bom_nin, nout)
+            // This call was wholly absorbed while detecting the BOM (e.g. it
+            // contained a complete BOM or a still-matching prefix).
+            (ReadFieldResult::InputEmpty, nin_total, nout_total)
+        }
     }
 
     /// Parse a single CSV record in `input` and copy each field contiguously
@@ -594,28 +690,148 @@ impl Reader {
         output: &mut [u8],
         ends: &mut [usize],
     ) -> (ReadRecordResult, usize, usize, usize) {
-        let (input, bom_nin) = self.strip_utf8_bom(input);
-        let (res, nin, nout, nend) = if self.use_nfa {
-            self.read_record_nfa(input, output, ends)
+        let (mut nout_total, mut nend_total) = (0, 0);
+
+        // Advance BOM detection. `rest` is the portion of this call's input
+        // still owed to the parser; any prefix bytes retained for detection
+        // were counted as consumed in the call that received them.
+        let rest = self.bom_detect(input);
+        let nin_total = input.len() - rest.len();
+
+        // A prefix that turned out not to be a BOM (or was left dangling when
+        // the caller signalled end) must now be parsed as ordinary data.
+        let mut staged = [0u8; 3];
+        let staged_len = self.bom_data_len;
+        staged[..staged_len].copy_from_slice(&self.bom_data[..staged_len]);
+        if staged_len > 0 {
+            let (res, c, nout, nend) = if self.use_nfa {
+                self.read_record_nfa(
+                    &staged[..staged_len],
+                    &mut output[nout_total..],
+                    &mut ends[nend_total..],
+                )
+            } else {
+                self.read_record_dfa(
+                    &staged[..staged_len],
+                    &mut output[nout_total..],
+                    &mut ends[nend_total..],
+                )
+            };
+            self.bom_consume_staged(c);
+            nout_total += nout;
+            nend_total += nend;
+            // Stop while staged bytes remain: `rest` belongs after them and
+            // must not be parsed (nor consumed) out of order.
+            if res != ReadRecordResult::InputEmpty || c < staged_len {
+                return (res, nin_total, nout_total, nend_total);
+            }
+        }
+
+        if !rest.is_empty() {
+            let (res, c, nout, nend) = if self.use_nfa {
+                self.read_record_nfa(
+                    rest,
+                    &mut output[nout_total..],
+                    &mut ends[nend_total..],
+                )
+            } else {
+                self.read_record_dfa(
+                    rest,
+                    &mut output[nout_total..],
+                    &mut ends[nend_total..],
+                )
+            };
+            (res, nin_total + c, nout_total + nout, nend_total + nend)
+        } else if input.is_empty() {
+            // Only a genuinely empty input from the caller may advance the
+            // parser into its final state. A non-empty chunk that consisted
+            // solely of BOM bytes must not be mistaken for end of input.
+            let (res, _, nout, nend) = if self.use_nfa {
+                self.read_record_nfa(
+                    &[],
+                    &mut output[nout_total..],
+                    &mut ends[nend_total..],
+                )
+            } else {
+                self.read_record_dfa(
+                    &[],
+                    &mut output[nout_total..],
+                    &mut ends[nend_total..],
+                )
+            };
+            (res, 0, nout_total + nout, nend_total + nend)
         } else {
-            self.read_record_dfa(input, output, ends)
-        };
-        self.has_read = true;
-        (res, nin + bom_nin, nout, nend)
+            // This call was wholly absorbed while detecting the BOM (e.g. it
+            // contained a complete BOM or a still-matching prefix).
+            (ReadRecordResult::InputEmpty, nin_total, nout_total, nend_total)
+        }
     }
 
-    /// Strip off a possible UTF-8 BOM at the start of a file. Quick note that
-    /// this method will fail to strip off the BOM if only part of the BOM is
-    /// buffered. Hopefully that won't happen very often.
-    fn strip_utf8_bom<'a>(&self, input: &'a [u8]) -> (&'a [u8], usize) {
-        if !self.has_read
-            && input.len() >= 3
-            && &input[0..3] == b"\xef\xbb\xbf"
-        {
-            (&input[3..], 3)
-        } else {
-            (input, 0)
+    /// Advance UTF-8 BOM detection over the caller's input and return the
+    /// slice that still has to be fed to the parser.
+    ///
+    /// Only the bytes at logical position `0` are considered. Bytes that
+    /// match a prefix of `EF BB BF` are retained pending more input; a
+    /// complete signature is stripped; anything else (including end of input
+    /// while only part of the signature was seen) releases the retained bytes
+    /// as ordinary data via `bom_data`. Bytes retained or stripped are
+    /// considered consumed by the call that provided them.
+    fn bom_detect<'a>(&mut self, input: &'a [u8]) -> &'a [u8] {
+        if !self.bom_checking {
+            return input;
         }
+        const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+        let mut i = 0;
+        while i < input.len() {
+            let b = input[i];
+            if b == BOM[self.bom_len] {
+                self.bom_len += 1;
+                i += 1;
+                if self.bom_len == BOM.len() {
+                    // Confirmed BOM: drop all three signature bytes and stop
+                    // looking for a BOM for the remainder of this stream.
+                    self.bom_len = 0;
+                    self.bom_checking = false;
+                    return &input[i..];
+                }
+            } else {
+                // Mismatch. The retained prefix bytes (if any) are ordinary
+                // data and must be replayed before the current byte.
+                self.bom_checking = false;
+                let prefix_len = self.bom_len;
+                self.bom_len = 0;
+                self.bom_data[..prefix_len]
+                    .copy_from_slice(&BOM[..prefix_len]);
+                self.bom_data[prefix_len] = b;
+                self.bom_data_len = prefix_len + 1;
+                return &input[i + 1..];
+            }
+        }
+        // All provided bytes match a prefix of the signature and are retained.
+        if input.is_empty() {
+            // The caller signals end of input. A dangling partial signature is
+            // not a BOM; release whatever was retained as ordinary data.
+            let prefix_len = self.bom_len;
+            if prefix_len > 0 {
+                self.bom_data[..prefix_len]
+                    .copy_from_slice(&BOM[..prefix_len]);
+                self.bom_data_len = prefix_len;
+                self.bom_len = 0;
+            }
+            self.bom_checking = false;
+        }
+        &input[input.len()..]
+    }
+
+    /// Drop `consumed` staged bytes after the parser accepted them, compacting
+    /// any bytes the parser has not yet consumed toward the front.
+    fn bom_consume_staged(&mut self, consumed: usize) {
+        debug_assert!(consumed <= self.bom_data_len);
+        let rest = self.bom_data_len - consumed;
+        if rest > 0 {
+            self.bom_data.copy_within(consumed..self.bom_data_len, 0);
+        }
+        self.bom_data_len = rest;
     }
 
     #[inline(always)]
@@ -877,7 +1093,7 @@ impl Reader {
         if ends.is_empty() {
             return (ReadRecordResult::OutputEndsFull, 0, 0, 0);
         }
-        let (mut nin, mut nout, mut nend) = (0, self.output_pos, 0);
+        let (mut nin, mut nout, mut nend) = (0, 0, 0);
         let mut state = self.nfa_state;
         while nin < input.len() && nout < output.len() && nend < ends.len() {
             let (s, io) = self.transition_nfa(state, input[nin]);
@@ -894,7 +1110,7 @@ impl Reader {
             }
             state = s;
             if state.is_field_final() {
-                ends[nend] = nout;
+                ends[nend] = self.output_pos + nout;
                 nend += 1;
                 if state != NfaState::EndFieldDelim {
                     break;
@@ -908,7 +1124,8 @@ impl Reader {
             nend >= ends.len(),
         );
         self.nfa_state = state;
-        self.output_pos = if res.is_record() { 0 } else { nout };
+        self.output_pos =
+            if res.is_record() { 0 } else { self.output_pos + nout };
         (res, nin, nout, nend)
     }
 

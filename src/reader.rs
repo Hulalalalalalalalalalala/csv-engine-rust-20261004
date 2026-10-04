@@ -1842,6 +1842,9 @@ impl<R: io::Read + io::Seek> Reader<R> {
         }
         self.rdr.seek(io::SeekFrom::Start(pos.byte()))?;
         self.core.reset();
+        // A UTF-8 BOM is only stripped at byte position 0. Seeking to any
+        // other record offset must leave matching bytes untouched.
+        self.core.set_bom_checking(pos.byte() == 0);
         self.core.set_line(pos.line());
         self.state.cur_pos = pos;
         self.state.eof = ReaderEofState::NotEof;
@@ -1870,6 +1873,9 @@ impl<R: io::Read + io::Seek> Reader<R> {
         self.state.seeked = true;
         self.rdr.seek(seek_from)?;
         self.core.reset();
+        // A UTF-8 BOM is only stripped at byte position 0. Seeking to any
+        // other record offset must leave matching bytes untouched.
+        self.core.set_bom_checking(pos.byte() == 0);
         self.core.set_line(pos.line());
         self.state.cur_pos = pos;
         self.state.eof = ReaderEofState::NotEof;
