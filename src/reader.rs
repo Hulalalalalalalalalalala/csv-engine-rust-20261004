@@ -3376,4 +3376,173 @@ mod tests {
         assert_eq!(records, vec![ByteRecord::from(vec!["a"])]);
         assert!(rdr.is_done());
     }
+
+    /// A reader that delivers at most `chunk` bytes per `read` call.
+    struct Chunked {
+        cursor: io::Cursor<Vec<u8>>,
+        chunk: usize,
+    }
+
+    impl Chunked {
+        fn new(data: &[u8], chunk: usize) -> Chunked {
+            Chunked { cursor: io::Cursor::new(data.to_vec()), chunk }
+        }
+    }
+
+    impl io::Read for Chunked {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let cap = buf.len().min(self.chunk);
+            self.cursor.read(&mut buf[..cap])
+        }
+    }
+
+    /// A reader with a non-newline record terminator and a comment marker:
+    /// `|` ends records while `\n` ends comments and counts lines.
+    fn comment_rdr<R: io::Read>(rdr: R) -> super::Reader<R> {
+        ReaderBuilder::new()
+            .has_headers(false)
+            .terminator(crate::Terminator::Any(b'|'))
+            .comment(Some(b'#'))
+            .from_reader(rdr)
+    }
+
+    // A comment started at the beginning of a record runs to the next `\n`,
+    // even when records are ended by a different byte. The `\n` inside an
+    // ordinary field is data and does not split the record.
+    #[test]
+    fn comment_custom_terminator() {
+        let data = b("a\nb,1|# note\nc,2|");
+        let mut rdr = comment_rdr(data);
+        let mut rec = StringRecord::new();
+
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rec, StringRecord::from(vec!["a\nb", "1"]));
+        assert_eq!(rec.position(), Some(&newpos(0, 1, 0)));
+
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rec, StringRecord::from(vec!["c", "2"]));
+        assert_eq!(rec.position(), Some(&newpos(6, 2, 1)));
+
+        assert!(!rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rdr.position(), &newpos(17, 3, 2));
+    }
+
+    // Reading the same data one byte at a time must produce the same
+    // records, the same positions and the same final line number as
+    // reading it in arbitrarily large chunks.
+    #[test]
+    fn comment_custom_terminator_chunk_invariant() {
+        let data = b("a\nb,1|# n\r\nc,2|\"x\ny\",3|p\rq,4|# trailing");
+        let expected: Vec<(Vec<&str>, Position)> = vec![
+            (vec!["a\nb", "1"], newpos(0, 1, 0)),
+            (vec!["c", "2"], newpos(6, 2, 1)),
+            (vec!["x\ny", "3"], newpos(15, 3, 2)),
+            (vec!["p\rq", "4"], newpos(23, 4, 3)),
+        ];
+        let expected_end = newpos(39, 4, 4);
+        for chunk in 1..=data.len() {
+            let mut rdr = comment_rdr(Chunked::new(data, chunk));
+            let mut got = vec![];
+            let mut rec = StringRecord::new();
+            while rdr.read_record(&mut rec).unwrap() {
+                let fields: Vec<String> =
+                    rec.iter().map(|f| f.to_string()).collect();
+                got.push((fields, rec.position().unwrap().clone()));
+            }
+            let want: Vec<(Vec<String>, Position)> = expected
+                .iter()
+                .map(|&(ref fields, ref pos)| {
+                    (
+                        fields.iter().map(|f| f.to_string()).collect(),
+                        pos.clone(),
+                    )
+                })
+                .collect();
+            assert_eq!(want, got, "chunk={}", chunk);
+            assert_eq!(&expected_end, rdr.position(), "chunk={}", chunk);
+        }
+    }
+
+    // Byte records, string records and Serde deserialization all report
+    // positions consistently, and error positions do not depend on how the
+    // input is chunked.
+    #[test]
+    fn comment_custom_terminator_positions_and_errors() {
+        for chunk in 1..=20 {
+            // Unequal field counts: the bad record starts right after the
+            // first record, at the comment.
+            let data = b("a,1|# note\nc,2,3|");
+            let mut rdr = comment_rdr(Chunked::new(data, chunk));
+            let mut rec = ByteRecord::new();
+            assert!(rdr.read_byte_record(&mut rec).unwrap());
+            let err = rdr.read_byte_record(&mut rec).unwrap_err();
+            match *err.kind() {
+                ErrorKind::UnequalLengths { ref pos, expected_len, len } => {
+                    assert_eq!(pos.as_ref(), Some(&newpos(4, 1, 1)));
+                    assert_eq!((expected_len, len), (2, 3));
+                }
+                ref wrong => {
+                    panic!("expected UnequalLengths, got {:?}", wrong)
+                }
+            }
+            // Reading can continue after the error.
+            assert!(!rdr.read_byte_record(&mut rec).unwrap());
+            assert_eq!(rdr.position(), &newpos(17, 2, 2));
+
+            // Invalid UTF-8 in a string record.
+            let data: &[u8] = b"a,1|# note\n\xff,2|";
+            let mut rdr = comment_rdr(Chunked::new(data, chunk));
+            let mut rec = StringRecord::new();
+            assert!(rdr.read_record(&mut rec).unwrap());
+            let err = rdr.read_record(&mut rec).unwrap_err();
+            match *err.kind() {
+                ErrorKind::Utf8 { ref pos, .. } => {
+                    assert_eq!(pos.as_ref(), Some(&newpos(4, 1, 1)));
+                }
+                ref wrong => panic!("expected Utf8, got {:?}", wrong),
+            }
+
+            // A failed numeric mapping through Serde.
+            let data = b("a,1|# note\nc,x|d,3|");
+            let mut rdr = comment_rdr(Chunked::new(data, chunk));
+            let mut iter = rdr.deserialize::<(String, u32)>();
+            assert_eq!(iter.next().unwrap().unwrap(), ("a".to_string(), 1));
+            let err = iter.next().unwrap().unwrap_err();
+            match *err.kind() {
+                ErrorKind::Deserialize { ref pos, .. } => {
+                    assert_eq!(pos.as_ref(), Some(&newpos(4, 1, 1)));
+                }
+                ref wrong => panic!("expected Deserialize, got {:?}", wrong),
+            }
+            assert_eq!(iter.next().unwrap().unwrap(), ("d".to_string(), 3));
+            assert!(iter.next().is_none());
+        }
+    }
+
+    // Seeking to a saved position re-reads the same record, and line
+    // numbers continue from the saved value.
+    #[test]
+    fn comment_custom_terminator_seek() {
+        let data = b("a\nb,1|# note\nc,2|d,3|");
+        let mut rdr = comment_rdr(io::Cursor::new(&data[..]));
+        let mut rec = StringRecord::new();
+
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert!(rdr.read_record(&mut rec).unwrap());
+        let pos = rec.position().unwrap().clone();
+        assert_eq!(pos, newpos(6, 2, 1));
+
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rec, StringRecord::from(vec!["d", "3"]));
+
+        rdr.seek(pos).unwrap();
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rec, StringRecord::from(vec!["c", "2"]));
+        assert_eq!(rec.position(), Some(&newpos(6, 2, 1)));
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rec, StringRecord::from(vec!["d", "3"]));
+        assert_eq!(rec.position(), Some(&newpos(17, 3, 2)));
+        assert!(!rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rdr.position(), &newpos(21, 3, 3));
+    }
 }

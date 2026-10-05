@@ -368,4 +368,40 @@ c
         assert_eq!(idx.read_at(2), vec!["b"]);
         assert_eq!(idx.read_at(3), vec!["c"]);
     }
+
+    // With a non-newline record terminator and a comment marker, comments
+    // must not become index entries, and the header record is still
+    // included when headers are enabled. The index is written to a local
+    // file and reopened before use.
+    #[test]
+    fn comment_custom_terminator_file_index() {
+        let data = "h1,h2|# note\na,1|b,2|# trailing";
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .terminator(csv::Terminator::Any(b'|'))
+            .comment(Some(b'#'))
+            .from_reader(io::Cursor::new(data));
+
+        let path = std::env::temp_dir()
+            .join(format!("csv-index-test-comment-{}", std::process::id()));
+        {
+            let mut wtr = std::fs::File::create(&path).unwrap();
+            RandomAccessSimple::create(&mut rdr, &mut wtr).unwrap();
+        }
+        let mut idx =
+            RandomAccessSimple::open(std::fs::File::open(&path).unwrap())
+                .unwrap();
+        std::fs::remove_file(&path).ok();
+
+        // The header plus two records; the two comments are not indexed.
+        assert_eq!(idx.len(), 3);
+        let expected: Vec<Vec<&str>> =
+            vec![vec!["h1", "h2"], vec!["a", "1"], vec!["b", "2"]];
+        for (i, want) in expected.iter().enumerate() {
+            let pos = idx.get(i as u64).unwrap();
+            rdr.seek(pos).unwrap();
+            let got = rdr.records().next().unwrap().unwrap();
+            assert_eq!(&got.iter().collect::<Vec<&str>>(), want);
+        }
+    }
 }

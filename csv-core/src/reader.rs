@@ -914,9 +914,20 @@ impl Reader {
                 }
             }
             if state == self.dfa.in_field || state == self.dfa.in_quoted {
+                let scanned = nin;
                 self.dfa
                     .classes
                     .scan_and_copy(input, &mut nin, output, &mut nout);
+                // The bytes copied by `scan_and_copy` skip the per-byte
+                // loop above, so any newlines among them would otherwise
+                // evade the line counter (and whether they are reached by
+                // this fast path or the main loop depends on how the caller
+                // chunks the input). Only bytes in the default equivalence
+                // class are ever copied, so when `\n` has its own class
+                // there is nothing to count.
+                if self.dfa.classes.classes[b'\n' as usize] == 0 {
+                    self.line += count_lfs(&input[scanned..nin]);
+                }
             }
         }
         let res = self.dfa.new_read_record_result(
@@ -987,7 +998,14 @@ impl Reader {
         // parsing a new record, then we should sink into the final state
         // and never move from there. (pro-tip: the start state doubles as
         // the final state!)
-        if state >= self.dfa.final_record || state.is_start() {
+        //
+        // A comment that runs to the end of the input is dropped entirely:
+        // like the start state, it must not emit a final (empty) record.
+        // This matches the NFA, which sends `InComment` to `End`.
+        if state >= self.dfa.final_record
+            || state.is_start()
+            || state == self.dfa.new_state(NfaState::InComment)
+        {
             self.dfa.new_state_final_end()
         } else {
             self.dfa.new_state_final_record()
@@ -1051,6 +1069,18 @@ impl Reader {
                 self.dfa.classes.add(b'\r');
                 self.dfa.classes.add(b'\n');
             }
+        }
+        // A comment is only ever ended by `\n` (see the `InComment` arm of
+        // `transition_nfa`), so when comments are enabled, `\n` must be
+        // distinguishable from ordinary bytes in the DFA. If nothing else
+        // has given `\n` its own equivalence class (a CRLF terminator does,
+        // for example), then add it now. Without this, `\n` falls into the
+        // default class and the DFA can never leave the comment state,
+        // which swallows the rest of the input into the comment.
+        if self.comment.is_some()
+            && self.dfa.classes.classes[b'\n' as usize] == 0
+        {
+            self.dfa.classes.add(b'\n');
         }
         // Build the DFA transition table by computing the DFA state for all
         // possible combinations of state and input byte.
@@ -1121,10 +1151,12 @@ impl Reader {
             match io {
                 NfaInputAction::CopyToOutput => {
                     output[nout] = input[nin];
+                    self.line += (input[nin] == b'\n') as u64;
                     nout += 1;
                     nin += 1;
                 }
                 NfaInputAction::Discard => {
+                    self.line += (input[nin] == b'\n') as u64;
                     nin += 1;
                 }
                 NfaInputAction::Epsilon => {}
@@ -1173,10 +1205,12 @@ impl Reader {
             match io {
                 NfaInputAction::CopyToOutput => {
                     output[nout] = input[nin];
+                    self.line += (input[nin] == b'\n') as u64;
                     nout += 1;
                     nin += 1;
                 }
                 NfaInputAction::Discard => {
+                    self.line += (input[nin] == b'\n') as u64;
                     nin += 1;
                 }
                 NfaInputAction::Epsilon => (),
@@ -1326,6 +1360,16 @@ const TRANS_SIZE: usize = TRANS_CLASSES * DFA_STATES;
 /// The number of possible transition classes. (See the comment on `TRANS_SIZE`
 /// for more details.)
 const CLASS_SIZE: usize = 256;
+
+/// Count the number of `\n` bytes in the given slice.
+///
+/// This is used to account for newlines consumed by the DFA's fast copy
+/// path, which bypasses the main per-byte loop where lines are normally
+/// counted.
+#[inline(always)]
+fn count_lfs(bytes: &[u8]) -> u64 {
+    bytes.iter().filter(|&&b| b == b'\n').count() as u64
+}
 
 /// A representation of a DFA.
 ///
@@ -1560,7 +1604,12 @@ impl Clone for DfaClasses {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use core::str;
+
+    use std::vec;
+    use std::vec::Vec;
 
     use arrayvec::{ArrayString, ArrayVec};
 
@@ -1959,6 +2008,82 @@ mod tests {
         }
     );
 
+    // When the record terminator is not a newline, a comment is still
+    // ended by `\n` only, and the record terminator is inert inside a
+    // comment. (This exercises the DFA's `\n` equivalence class: without
+    // it, the DFA can never leave the comment state.)
+    parses_to!(
+        comment_custom_terminator,
+        "a\nb,1|# note\nc,2|",
+        csv![["a\nb", "1"], ["c", "2"]],
+        |b: &mut ReaderBuilder| {
+            b.terminator(Terminator::Any(b'|')).comment(Some(b'#'));
+        }
+    );
+    parses_to!(
+        comment_custom_terminator_inert_bytes,
+        "a,1|# x,\"y|\"z\nc,2|",
+        csv![["a", "1"], ["c", "2"]],
+        |b: &mut ReaderBuilder| {
+            b.terminator(Terminator::Any(b'|')).comment(Some(b'#'));
+        }
+    );
+    parses_to!(
+        comment_custom_terminator_consecutive,
+        "# x\n# y\nc,2|",
+        csv![["c", "2"]],
+        |b: &mut ReaderBuilder| {
+            b.terminator(Terminator::Any(b'|')).comment(Some(b'#'));
+        }
+    );
+    parses_to!(
+        comment_custom_terminator_marker_in_field,
+        "a#b,1|\"#c\",2|",
+        csv![["a#b", "1"], ["#c", "2"]],
+        |b: &mut ReaderBuilder| {
+            b.terminator(Terminator::Any(b'|')).comment(Some(b'#'));
+        }
+    );
+    // The same, but with every special byte configured (delimiter, quote,
+    // escape, comment and a non-newline terminator all distinct).
+    parses_to!(
+        comment_custom_terminator_with_escape,
+        "\"a!\"b\",1|# !\"|\nc,2|",
+        csv![["a\"b", "1"], ["c", "2"]],
+        |b: &mut ReaderBuilder| {
+            b.terminator(Terminator::Any(b'|'))
+                .comment(Some(b'#'))
+                .escape(Some(b'!'));
+        }
+    );
+
+    // A comment that runs to the end of the input is dropped. It must not
+    // produce an empty record.
+    parses_to!(
+        comment_at_eof,
+        "a,1\n# note",
+        csv![["a", "1"]],
+        |b: &mut ReaderBuilder| {
+            b.comment(Some(b'#'));
+        }
+    );
+    parses_to!(
+        comment_at_eof_custom_terminator,
+        "a,1|# note",
+        csv![["a", "1"]],
+        |b: &mut ReaderBuilder| {
+            b.terminator(Terminator::Any(b'|')).comment(Some(b'#'));
+        }
+    );
+    parses_to!(
+        comment_at_eof_only,
+        "# note",
+        csv![],
+        |b: &mut ReaderBuilder| {
+            b.terminator(Terminator::Any(b'|')).comment(Some(b'#'));
+        }
+    );
+
     macro_rules! assert_read {
         (
             $rdr:expr, $input:expr, $output:expr,
@@ -2169,6 +2294,200 @@ mod tests {
 
         assert_read!(rdr, &[], &mut [0], 0, 0, End);
         assert_eq!(6, rdr.line());
+    }
+
+    /// Read all records from `data`, feeding the reader in `chunk` sized
+    /// pieces. Returns the records and the final line number.
+    #[cfg(test)]
+    fn read_records_chunked(
+        rdr: &mut Reader,
+        data: &[u8],
+        chunk: usize,
+    ) -> (Vec<Vec<Vec<u8>>>, u64) {
+        use crate::ReadRecordResult::*;
+
+        let mut records = vec![];
+        let mut out = [0u8; 64];
+        let mut ends = [0usize; 8];
+        let (mut outpos, mut endpos) = (0, 0);
+        let mut i = 0;
+        loop {
+            let end =
+                if i >= data.len() { i } else { (i + chunk).min(data.len()) };
+            let (res, nin, nout, nend) = rdr.read_record(
+                &data[i..end],
+                &mut out[outpos..],
+                &mut ends[endpos..],
+            );
+            i += nin;
+            outpos += nout;
+            endpos += nend;
+            match res {
+                InputEmpty => assert_eq!(i, end),
+                OutputFull | OutputEndsFull => panic!("buffer too small"),
+                Record => {
+                    let mut rec = vec![];
+                    let mut start = 0;
+                    for &e in &ends[..endpos] {
+                        rec.push(out[start..e].to_vec());
+                        start = e;
+                    }
+                    records.push(rec);
+                    outpos = 0;
+                    endpos = 0;
+                }
+                End => break,
+            }
+        }
+        (records, rdr.line())
+    }
+
+    /// Like `read_records_chunked`, but reads one field at a time.
+    #[cfg(test)]
+    fn read_fields_chunked(
+        rdr: &mut Reader,
+        data: &[u8],
+        chunk: usize,
+    ) -> (Vec<Vec<Vec<u8>>>, u64) {
+        use crate::ReadFieldResult::*;
+
+        let mut records: Vec<Vec<Vec<u8>>> = vec![];
+        let mut row: Vec<Vec<u8>> = vec![];
+        let mut field: Vec<u8> = vec![];
+        let mut out = [0u8; 8];
+        let mut i = 0;
+        loop {
+            let end =
+                if i >= data.len() { i } else { (i + chunk).min(data.len()) };
+            let (res, nin, nout) = rdr.read_field(&data[i..end], &mut out);
+            i += nin;
+            field.extend_from_slice(&out[..nout]);
+            match res {
+                InputEmpty => assert_eq!(i, end),
+                OutputFull => {}
+                Field { record_end } => {
+                    row.push(core::mem::take(&mut field));
+                    if record_end {
+                        records.push(core::mem::take(&mut row));
+                    }
+                }
+                End => break,
+            }
+        }
+        (records, rdr.line())
+    }
+
+    fn comment_reader(use_nfa: bool) -> Reader {
+        let mut builder = ReaderBuilder::new();
+        builder
+            .terminator(Terminator::Any(b'|'))
+            .comment(Some(b'#'))
+            .nfa(use_nfa);
+        builder.build()
+    }
+
+    // The accumulated line number must not depend on how the input is
+    // chunked, and reading field-by-field must agree with reading
+    // record-by-record. This data exercises `\n` inside an unquoted field,
+    // inside a quoted field and inside a comment, a CRLF (counts once) and
+    // a lone `\r` (does not count), plus a comment that runs to EOF.
+    #[test]
+    fn line_numbers_custom_terminator_chunk_invariant() {
+        let data: &[u8] = b"a\nb,1|# n\r\nc,2|\"x\ny\",3|p\rq,4|# trailing";
+        let expected: Vec<Vec<Vec<u8>>> = vec![
+            vec![b"a\nb".to_vec(), b"1".to_vec()],
+            vec![b"c".to_vec(), b"2".to_vec()],
+            vec![b"x\ny".to_vec(), b"3".to_vec()],
+            vec![b"p\rq".to_vec(), b"4".to_vec()],
+        ];
+        // 4 newlines total: inside `a\nb`, ending the comment, inside
+        // `"x\ny"` and the LF of the comment's CRLF... see `data`.
+        let expected_line =
+            1 + data.iter().filter(|&&b| b == b'\n').count() as u64;
+        for use_nfa in &[false, true] {
+            for chunk in 1..=data.len() {
+                let (got, line) = read_records_chunked(
+                    &mut comment_reader(*use_nfa),
+                    data,
+                    chunk,
+                );
+                assert_eq!(
+                    expected, got,
+                    "record nfa={} chunk={}",
+                    use_nfa, chunk
+                );
+                assert_eq!(
+                    expected_line, line,
+                    "record nfa={} chunk={}",
+                    use_nfa, chunk
+                );
+
+                let (got, line) = read_fields_chunked(
+                    &mut comment_reader(*use_nfa),
+                    data,
+                    chunk,
+                );
+                assert_eq!(
+                    expected, got,
+                    "field nfa={} chunk={}",
+                    use_nfa, chunk
+                );
+                assert_eq!(
+                    expected_line, line,
+                    "field nfa={} chunk={}",
+                    use_nfa, chunk
+                );
+            }
+        }
+    }
+
+    // When output and field-end buffers are too small, only the newlines
+    // in actually consumed input may be counted; resuming must not count
+    // them again.
+    #[test]
+    fn line_numbers_tiny_output_buffers() {
+        use crate::ReadRecordResult::*;
+
+        let data: &[u8] = b"a\nb,1|# note\nc,2|";
+        let expected: Vec<Vec<Vec<u8>>> = vec![
+            vec![b"a\nb".to_vec(), b"1".to_vec()],
+            vec![b"c".to_vec(), b"2".to_vec()],
+        ];
+        for use_nfa in &[false, true] {
+            let mut rdr = comment_reader(*use_nfa);
+            let mut records = vec![];
+            let mut fields: Vec<u8> = vec![];
+            let mut fends: Vec<usize> = vec![];
+            let mut out = [0u8; 1];
+            let mut ends = [0usize; 1];
+            let mut i = 0;
+            loop {
+                let inp = if i < data.len() { &data[i..] } else { &[][..] };
+                let (res, nin, nout, nend) =
+                    rdr.read_record(inp, &mut out, &mut ends);
+                i += nin;
+                fields.extend_from_slice(&out[..nout]);
+                fends.extend_from_slice(&ends[..nend]);
+                match res {
+                    InputEmpty => assert_eq!(i, data.len()),
+                    OutputFull | OutputEndsFull => {}
+                    Record => {
+                        let mut rec = vec![];
+                        let mut start = 0;
+                        for &e in &fends {
+                            rec.push(fields[start..e].to_vec());
+                            start = e;
+                        }
+                        records.push(rec);
+                        fields.clear();
+                        fends.clear();
+                    }
+                    End => break,
+                }
+            }
+            assert_eq!(expected, records, "nfa={}", use_nfa);
+            assert_eq!(3, rdr.line(), "nfa={}", use_nfa);
+        }
     }
 
     macro_rules! assert_read_record {
