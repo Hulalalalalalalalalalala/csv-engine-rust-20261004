@@ -987,7 +987,14 @@ impl Reader {
         // parsing a new record, then we should sink into the final state
         // and never move from there. (pro-tip: the start state doubles as
         // the final state!)
-        if state >= self.dfa.final_record || state.is_start() {
+        //
+        // A comment that runs to the end of the input is also discarded
+        // without emitting a record, matching the NFA (which transitions
+        // `InComment` to `End` here).
+        if state >= self.dfa.final_record
+            || state.is_start()
+            || state == self.dfa.new_state(NfaState::InComment)
+        {
             self.dfa.new_state_final_end()
         } else {
             self.dfa.new_state_final_record()
@@ -1026,7 +1033,16 @@ impl Reader {
         //   4. The quote byte.
         //   5. The escape byte.
         //   6. The comment byte.
-        //   7. Everything else.
+        //   7. The LF byte, when it isn't already in one of the classes
+        //      above. LF always needs to be distinguishable, since it ends
+        //      comments and drives line numbers even when some other byte
+        //      terminates records.
+        //   8. Everything else.
+        //
+        // Not all of these can be occupied at once: at most 6 discriminating
+        // bytes (delimiter, quote, escape, comment, terminator and LF) ever
+        // coexist, which together with the default class fits into the 7
+        // slots available.
         //
         // We add those equivalence classes here. If more configuration knobs
         // are added to the parser with more discriminating bytes, then this
@@ -1051,6 +1067,16 @@ impl Reader {
                 self.dfa.classes.add(b'\r');
                 self.dfa.classes.add(b'\n');
             }
+        }
+        // LF must always be distinguishable from other bytes, even when it
+        // isn't the record terminator: it is what ends a comment (regardless
+        // of the terminator) and it is what line numbers count. If it were
+        // lumped into the default equivalence class, the DFA could never
+        // leave a comment when the terminator is some other byte, and
+        // `scan_and_copy` would copy LFs inside fields without counting
+        // them, making line numbers depend on how the input is chunked.
+        if self.dfa.classes.classes[b'\n' as usize] == 0 {
+            self.dfa.classes.add(b'\n');
         }
         // Build the DFA transition table by computing the DFA state for all
         // possible combinations of state and input byte.
@@ -1120,11 +1146,13 @@ impl Reader {
             let (s, io) = self.transition_nfa(state, input[nin]);
             match io {
                 NfaInputAction::CopyToOutput => {
+                    self.line += (input[nin] == b'\n') as u64;
                     output[nout] = input[nin];
                     nout += 1;
                     nin += 1;
                 }
                 NfaInputAction::Discard => {
+                    self.line += (input[nin] == b'\n') as u64;
                     nin += 1;
                 }
                 NfaInputAction::Epsilon => {}
@@ -1172,11 +1200,13 @@ impl Reader {
             let (s, io) = self.transition_nfa(state, input[nin]);
             match io {
                 NfaInputAction::CopyToOutput => {
+                    self.line += (input[nin] == b'\n') as u64;
                     output[nout] = input[nin];
                     nout += 1;
                     nin += 1;
                 }
                 NfaInputAction::Discard => {
+                    self.line += (input[nin] == b'\n') as u64;
                     nin += 1;
                 }
                 NfaInputAction::Epsilon => (),
@@ -1959,6 +1989,85 @@ mod tests {
         }
     );
 
+    // When the record terminator is a custom byte, LF is ordinary field
+    // data, but it is still what ends a comment.
+    parses_to!(
+        comment_custom_terminator,
+        "a\nb,1|# note\nc,2|",
+        csv![["a\nb", "1"], ["c", "2"]],
+        |b: &mut ReaderBuilder| {
+            b.terminator(Terminator::Any(b'|')).comment(Some(b'#'));
+        }
+    );
+    // A comment that runs to the end of the data is dropped without
+    // emitting a record.
+    parses_to!(
+        comment_custom_terminator_eof,
+        "a,1|# note",
+        csv![["a", "1"]],
+        |b: &mut ReaderBuilder| {
+            b.terminator(Terminator::Any(b'|')).comment(Some(b'#'));
+        }
+    );
+    parses_to!(
+        comment_custom_terminator_only_comment,
+        "# note",
+        csv![],
+        |b: &mut ReaderBuilder| {
+            b.terminator(Terminator::Any(b'|')).comment(Some(b'#'));
+        }
+    );
+    // Comment bytes in the middle of a field or inside quotes are data.
+    parses_to!(
+        comment_custom_terminator_mid_field,
+        "a#b,1|x#y,2|",
+        csv![["a#b", "1"], ["x#y", "2"]],
+        |b: &mut ReaderBuilder| {
+            b.terminator(Terminator::Any(b'|')).comment(Some(b'#'));
+        }
+    );
+    parses_to!(
+        comment_custom_terminator_quoted,
+        "\"#a\",1|\"x\ny\",2|",
+        csv![["#a", "1"], ["x\ny", "2"]],
+        |b: &mut ReaderBuilder| {
+            b.terminator(Terminator::Any(b'|')).comment(Some(b'#'));
+        }
+    );
+    // Inside a comment, delimiters, quotes and record terminators are all
+    // ignored until LF.
+    parses_to!(
+        comment_custom_terminator_specials_inside,
+        "a,1|# x,y\"|z\nc,2|",
+        csv![["a", "1"], ["c", "2"]],
+        |b: &mut ReaderBuilder| {
+            b.terminator(Terminator::Any(b'|')).comment(Some(b'#'));
+        }
+    );
+    // A comment is only recognized at the start of a record, even right
+    // after another comment.
+    parses_to!(
+        comment_custom_terminator_consecutive,
+        "# c1\n# c2\na,1|",
+        csv![["a", "1"]],
+        |b: &mut ReaderBuilder| {
+            b.terminator(Terminator::Any(b'|')).comment(Some(b'#'));
+        }
+    );
+    // The full complement of discriminating bytes (delimiter, terminator,
+    // quote, comment and escape, all distinct and none of them LF) still
+    // leaves room for LF to be its own DFA equivalence class.
+    parses_to!(
+        comment_custom_terminator_escape,
+        "\"a\\|b\",1|# x\\|y\nc,2|",
+        csv![["a|b", "1"], ["c", "2"]],
+        |b: &mut ReaderBuilder| {
+            b.terminator(Terminator::Any(b'|'))
+                .comment(Some(b'#'))
+                .escape(Some(b'\\'));
+        }
+    );
+
     macro_rules! assert_read {
         (
             $rdr:expr, $input:expr, $output:expr,
@@ -2169,6 +2278,242 @@ mod tests {
 
         assert_read!(rdr, &[], &mut [0], 0, 0, End);
         assert_eq!(6, rdr.line());
+    }
+
+    // Like `parse_by_record`, but feeds the input to the parser in chunks
+    // of `chunk` bytes and also returns the final line number.
+    fn parse_by_record_chunked(
+        rdr: &mut Reader,
+        data: &[u8],
+        chunk: usize,
+    ) -> (Csv, u64) {
+        use crate::ReadRecordResult::*;
+
+        let mut csv = Csv::new();
+        let mut record = [0; 1024];
+        let mut ends = [0; 10];
+        let (mut outpos, mut endpos) = (0, 0);
+        let mut i = 0;
+        loop {
+            let end = core::cmp::min(i + chunk, data.len());
+            let (res, nin, nout, nend) = rdr.read_record(
+                &data[i..end],
+                &mut record[outpos..],
+                &mut ends[endpos..],
+            );
+            i += nin;
+            outpos += nout;
+            endpos += nend;
+            match res {
+                InputEmpty => {
+                    if nin == 0 && nout == 0 && nend == 0 && i < data.len() {
+                        panic!("no progress")
+                    }
+                }
+                OutputFull => panic!("record too large (out buffer)"),
+                OutputEndsFull => panic!("record too large (end buffer)"),
+                Record => {
+                    let s = str::from_utf8(&record[..outpos]).unwrap();
+                    let mut start = 0;
+                    let mut row = Row::new();
+                    for &end in &ends[..endpos] {
+                        row.push(Field::from(&s[start..end]).unwrap());
+                        start = end;
+                    }
+                    csv.push(row);
+                    outpos = 0;
+                    endpos = 0;
+                }
+                End => return (csv, rdr.line()),
+            }
+        }
+    }
+
+    // Like `parse_by_field`, but feeds the input to the parser in chunks
+    // of `chunk` bytes and also returns the final line number.
+    fn parse_by_field_chunked(
+        rdr: &mut Reader,
+        data: &[u8],
+        chunk: usize,
+    ) -> (Csv, u64) {
+        let mut csv = Csv::new();
+        let mut row = Row::new();
+        let mut field = [0u8; 10];
+        let mut outpos = 0;
+        let mut i = 0;
+        loop {
+            let end = core::cmp::min(i + chunk, data.len());
+            let (res, nin, nout) =
+                rdr.read_field(&data[i..end], &mut field[outpos..]);
+            i += nin;
+            outpos += nout;
+            match res {
+                ReadFieldResult::InputEmpty => {
+                    if nin == 0 && nout == 0 && i < data.len() {
+                        panic!("no progress")
+                    }
+                }
+                ReadFieldResult::OutputFull => panic!("field too large"),
+                ReadFieldResult::Field { record_end } => {
+                    let s = str::from_utf8(&field[..outpos]).unwrap();
+                    row.push(Field::from(s).unwrap());
+                    outpos = 0;
+                    if record_end {
+                        csv.push(row);
+                        row = Row::new();
+                    }
+                }
+                ReadFieldResult::End => return (csv, rdr.line()),
+            }
+        }
+    }
+
+    // With a custom (non-LF) record terminator and comments enabled, the
+    // records parsed and the line numbers reported must not depend on how
+    // the input is chunked, and must agree between the NFA and the DFA and
+    // between field-wise and record-wise reads.
+    #[test]
+    fn line_numbers_custom_terminator_comment_chunked() {
+        let data = b("a\nb,1|# note\nc,2|");
+        let expected = csv![["a\nb", "1"], ["c", "2"]];
+        for use_nfa in &[false, true] {
+            for chunk in &[1usize, 2, 3, 5, 7, 17, 18, 1024] {
+                let mut builder = ReaderBuilder::new();
+                builder
+                    .terminator(Terminator::Any(b'|'))
+                    .comment(Some(b'#'))
+                    .nfa(*use_nfa);
+
+                let mut rdr = builder.build();
+                let (got, line) =
+                    parse_by_record_chunked(&mut rdr, data, *chunk);
+                assert_eq!(
+                    expected, got,
+                    "by record: use_nfa={} chunk={}",
+                    use_nfa, chunk
+                );
+                assert_eq!(
+                    3, line,
+                    "by record: use_nfa={} chunk={}",
+                    use_nfa, chunk
+                );
+
+                let mut rdr = builder.build();
+                let (got, line) =
+                    parse_by_field_chunked(&mut rdr, data, *chunk);
+                assert_eq!(
+                    expected, got,
+                    "by field: use_nfa={} chunk={}",
+                    use_nfa, chunk
+                );
+                assert_eq!(
+                    3, line,
+                    "by field: use_nfa={} chunk={}",
+                    use_nfa, chunk
+                );
+            }
+        }
+    }
+
+    // LFs inside quoted and unquoted fields count toward the line number,
+    // CRLF counts only once and a lone CR does not count at all, no matter
+    // how the input is chunked.
+    #[test]
+    fn line_numbers_custom_terminator_lf_in_fields() {
+        // 3 LFs total: one in a quoted field (as part of a CRLF), one in an
+        // unquoted field and one ending the comment. The CRs never count.
+        let data = b("\"x\r\ny\",1|a\nb,2|# c\rc\rd\nz,3|");
+        let expected = csv![["x\r\ny", "1"], ["a\nb", "2"], ["z", "3"]];
+        for use_nfa in &[false, true] {
+            for chunk in &[1usize, 2, 4, 13, 1024] {
+                let mut builder = ReaderBuilder::new();
+                builder
+                    .terminator(Terminator::Any(b'|'))
+                    .comment(Some(b'#'))
+                    .nfa(*use_nfa);
+
+                let mut rdr = builder.build();
+                let (got, line) =
+                    parse_by_record_chunked(&mut rdr, data, *chunk);
+                assert_eq!(
+                    expected, got,
+                    "by record: use_nfa={} chunk={}",
+                    use_nfa, chunk
+                );
+                assert_eq!(
+                    4, line,
+                    "by record: use_nfa={} chunk={}",
+                    use_nfa, chunk
+                );
+
+                let mut rdr = builder.build();
+                let (got, line) =
+                    parse_by_field_chunked(&mut rdr, data, *chunk);
+                assert_eq!(
+                    expected, got,
+                    "by field: use_nfa={} chunk={}",
+                    use_nfa, chunk
+                );
+                assert_eq!(
+                    4, line,
+                    "by field: use_nfa={} chunk={}",
+                    use_nfa, chunk
+                );
+            }
+        }
+    }
+
+    // Calls that consume no input must never change the line number, and
+    // output space limits must not cause LFs to be counted twice when the
+    // read is resumed.
+    #[test]
+    fn line_numbers_not_counted_twice() {
+        use crate::ReadFieldResult::*;
+
+        for use_nfa in &[false, true] {
+            let mut builder = ReaderBuilder::new();
+            builder.terminator(Terminator::Any(b'|')).nfa(*use_nfa);
+            let mut rdr = builder.build();
+            assert_eq!(1, rdr.line());
+
+            // An empty output buffer consumes nothing.
+            let (res, nin, _) = rdr.read_field(b("a\nb"), &mut []);
+            assert_eq!(OutputFull, res);
+            assert_eq!(0, nin);
+            assert_eq!(1, rdr.line());
+
+            // A one byte output buffer stops right after 'a'.
+            let (res, nin, nout) = rdr.read_field(b("a\nb"), &mut [0; 1]);
+            assert_eq!(OutputFull, res);
+            assert_eq!(1, nin);
+            assert_eq!(1, nout);
+            assert_eq!(1, rdr.line());
+
+            // The LF is consumed here, exactly once.
+            let (res, nin, _) = rdr.read_field(b("\nb"), &mut [0; 1]);
+            assert_eq!(OutputFull, res);
+            assert_eq!(1, nin);
+            assert_eq!(2, rdr.line());
+
+            // A call that consumes nothing changes nothing.
+            let (res, nin, _) = rdr.read_field(b("b"), &mut []);
+            assert_eq!(OutputFull, res);
+            assert_eq!(0, nin);
+            assert_eq!(2, rdr.line());
+
+            let (res, nin, _) = rdr.read_field(b("b"), &mut [0; 1]);
+            assert_eq!(InputEmpty, res);
+            assert_eq!(1, nin);
+            assert_eq!(2, rdr.line());
+
+            // End of input: no more line number changes.
+            let (res, _, _) = rdr.read_field(b(""), &mut [0; 1]);
+            assert_eq!(Field { record_end: true }, res);
+            assert_eq!(2, rdr.line());
+            let (res, _, _) = rdr.read_field(b(""), &mut [0; 1]);
+            assert_eq!(End, res);
+            assert_eq!(2, rdr.line());
+        }
     }
 
     macro_rules! assert_read_record {

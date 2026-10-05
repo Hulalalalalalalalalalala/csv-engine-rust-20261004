@@ -368,4 +368,71 @@ c
         assert_eq!(idx.read_at(2), vec!["b"]);
         assert_eq!(idx.read_at(3), vec!["c"]);
     }
+
+    // With a custom (non-LF) record terminator and comments enabled,
+    // comments must not become index entries, and every indexed position
+    // must read back the corresponding record.
+    #[test]
+    fn custom_terminator_comments() {
+        let data = "a,1|# note\nb,2|c,3|";
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .terminator(csv::Terminator::Any(b'|'))
+            .comment(Some(b'#'))
+            .from_reader(io::Cursor::new(data));
+        let mut idxbuf = io::Cursor::new(vec![]);
+        RandomAccessSimple::create(&mut rdr, &mut idxbuf).unwrap();
+        let mut idx = RandomAccessSimple::open(idxbuf).unwrap();
+        assert_eq!(idx.len(), 3);
+
+        for (i, expected) in
+            [vec!["a", "1"], vec!["b", "2"], vec!["c", "3"]].iter().enumerate()
+        {
+            let pos = idx.get(i as u64).unwrap();
+            rdr.seek(pos).unwrap();
+            let rec = rdr.records().next().unwrap().unwrap();
+            assert_eq!(rec.iter().collect::<Vec<_>>(), expected.as_slice());
+        }
+        assert!(idx.get(3).is_err());
+    }
+
+    // Same as above, but with headers enabled (the header is indexed) and
+    // with the index written to a local file and reopened.
+    #[test]
+    fn custom_terminator_comments_headers_file() {
+        use std::io::Write;
+
+        let data = "h1,h2|# note\na,1|b,2|";
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .terminator(csv::Terminator::Any(b'|'))
+            .comment(Some(b'#'))
+            .from_reader(io::Cursor::new(data));
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("csv-index-test-{}.idx", std::process::id()));
+        {
+            let mut wtr =
+                io::BufWriter::new(std::fs::File::create(&path).unwrap());
+            RandomAccessSimple::create(&mut rdr, &mut wtr).unwrap();
+            wtr.flush().unwrap();
+        }
+        let mut idx =
+            RandomAccessSimple::open(std::fs::File::open(&path).unwrap())
+                .unwrap();
+        std::fs::remove_file(&path).ok();
+
+        // The header counts, the comment does not.
+        assert_eq!(idx.len(), 3);
+        for (i, expected) in [vec!["h1", "h2"], vec!["a", "1"], vec!["b", "2"]]
+            .iter()
+            .enumerate()
+        {
+            let pos = idx.get(i as u64).unwrap();
+            rdr.seek(pos).unwrap();
+            let rec = rdr.records().next().unwrap().unwrap();
+            assert_eq!(rec.iter().collect::<Vec<_>>(), expected.as_slice());
+        }
+        assert!(idx.get(3).is_err());
+    }
 }

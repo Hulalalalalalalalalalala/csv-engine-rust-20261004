@@ -2882,6 +2882,187 @@ mod tests {
         assert_eq!(pos.record(), 1);
     }
 
+    // Test that positions are reported consistently when records end with
+    // a custom (non-LF) byte and comments are enabled. LF only ends
+    // comments and bumps the line number; the custom byte ends records.
+    // Skipped comments don't get record numbers.
+    #[test]
+    fn positions_custom_terminator_comments() {
+        let data = b("a\nb,1|# note\nc,2|");
+        let mut rdr = ReaderBuilder::new()
+            .has_headers(false)
+            .terminator(crate::Terminator::Any(b'|'))
+            .comment(Some(b'#'))
+            .from_reader(io::Cursor::new(data));
+
+        assert_eq!(&newpos(0, 1, 0), rdr.position());
+        let mut rec = ByteRecord::new();
+        assert!(rdr.read_byte_record(&mut rec).unwrap());
+        assert_eq!(rec, ByteRecord::from(vec!["a\nb", "1"]));
+        assert_eq!(&newpos(0, 1, 0), rec.position().unwrap());
+        assert_eq!(&newpos(6, 2, 1), rdr.position());
+
+        assert!(rdr.read_byte_record(&mut rec).unwrap());
+        assert_eq!(rec, ByteRecord::from(vec!["c", "2"]));
+        // The position of a record is the one saved before reading it
+        // started, which includes the skipped comment preceding it. The
+        // comment does not get a record number, though.
+        assert_eq!(&newpos(6, 2, 1), rec.position().unwrap());
+        assert_eq!(&newpos(17, 3, 2), rdr.position());
+
+        assert!(!rdr.read_byte_record(&mut rec).unwrap());
+        assert_eq!(&newpos(17, 3, 2), rdr.position());
+    }
+
+    // Test that string records see the same positions as byte records when
+    // records end with a custom byte and comments are enabled.
+    #[test]
+    fn positions_custom_terminator_comments_string_record() {
+        let data = b("a\nb,1|# note\nc,2|");
+        let mut rdr = ReaderBuilder::new()
+            .has_headers(false)
+            .terminator(crate::Terminator::Any(b'|'))
+            .comment(Some(b'#'))
+            .from_reader(io::Cursor::new(data));
+
+        let mut rec = StringRecord::new();
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rec, StringRecord::from(vec!["a\nb", "1"]));
+        assert_eq!(&newpos(0, 1, 0), rec.position().unwrap());
+
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rec, StringRecord::from(vec!["c", "2"]));
+        assert_eq!(&newpos(6, 2, 1), rec.position().unwrap());
+
+        assert!(!rdr.read_record(&mut rec).unwrap());
+        assert_eq!(&newpos(17, 3, 2), rdr.position());
+    }
+
+    // Test that seeking to a saved position re-reads the same record and
+    // that line numbers continue from the saved value, with a custom
+    // record terminator and comments.
+    #[test]
+    fn seek_custom_terminator_comments() {
+        let data = b("a\nb,1|# note\nc,2|d,3|");
+        let mut rdr = ReaderBuilder::new()
+            .has_headers(false)
+            .terminator(crate::Terminator::Any(b'|'))
+            .comment(Some(b'#'))
+            .from_reader(io::Cursor::new(data));
+
+        let mut rec = StringRecord::new();
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rec, StringRecord::from(vec!["a\nb", "1"]));
+
+        let pos = rdr.position().clone();
+        assert_eq!(newpos(6, 2, 1), pos);
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rec, StringRecord::from(vec!["c", "2"]));
+
+        rdr.seek(pos).unwrap();
+        assert_eq!(&newpos(6, 2, 1), rdr.position());
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rec, StringRecord::from(vec!["c", "2"]));
+        assert_eq!(&newpos(6, 2, 1), rec.position().unwrap());
+
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rec, StringRecord::from(vec!["d", "3"]));
+        assert_eq!(&newpos(17, 3, 2), rec.position().unwrap());
+        assert_eq!(&newpos(21, 3, 3), rdr.position());
+
+        assert!(!rdr.read_record(&mut rec).unwrap());
+    }
+
+    // Test that an unequal lengths error carries the position of the
+    // offending record, with a custom record terminator and comments.
+    #[test]
+    fn unequal_lengths_custom_terminator_comments() {
+        let data = b("a,1|# c\nb,2,3|");
+        let mut rdr = ReaderBuilder::new()
+            .has_headers(false)
+            .terminator(crate::Terminator::Any(b'|'))
+            .comment(Some(b'#'))
+            .from_reader(io::Cursor::new(data));
+
+        let mut rec = ByteRecord::new();
+        assert!(rdr.read_byte_record(&mut rec).unwrap());
+        let err = rdr.read_byte_record(&mut rec).unwrap_err();
+        match *err.kind() {
+            ErrorKind::UnequalLengths { ref pos, expected_len, len } => {
+                assert_eq!(&Some(newpos(4, 1, 1)), pos);
+                assert_eq!(2, expected_len);
+                assert_eq!(3, len);
+            }
+            ref x => panic!("expected UnequalLengths, got {:?}", x),
+        }
+        // Reading can continue after the error.
+        assert!(!rdr.read_byte_record(&mut rec).unwrap());
+    }
+
+    // Test that a UTF-8 error carries the position of the offending
+    // record, with a custom record terminator and comments.
+    #[test]
+    fn utf8_error_custom_terminator_comments() {
+        let data = b"a,1|# c\nb,\xFF|c,3|";
+        let mut rdr = ReaderBuilder::new()
+            .has_headers(false)
+            .terminator(crate::Terminator::Any(b'|'))
+            .comment(Some(b'#'))
+            .from_reader(io::Cursor::new(data));
+
+        let mut rec = StringRecord::new();
+        assert!(rdr.read_record(&mut rec).unwrap());
+        let err = rdr.read_record(&mut rec).unwrap_err();
+        match *err.kind() {
+            ErrorKind::Utf8 { ref pos, .. } => {
+                assert_eq!(&Some(newpos(4, 1, 1)), pos);
+            }
+            ref x => panic!("expected Utf8, got {:?}", x),
+        }
+        // Reading can continue after the error.
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rec, StringRecord::from(vec!["c", "3"]));
+        assert_eq!(&newpos(12, 2, 2), rec.position().unwrap());
+    }
+
+    // Test that Serde deserialization sees the same records and positions
+    // as the other read APIs, with a custom record terminator and
+    // comments.
+    #[test]
+    fn deserialize_custom_terminator_comments() {
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        struct Row {
+            name: String,
+            value: i32,
+        }
+
+        let data = b("a\nb,1|# note\nc,2|d,oops|e,4|");
+        let mut rows = ReaderBuilder::new()
+            .has_headers(false)
+            .terminator(crate::Terminator::Any(b'|'))
+            .comment(Some(b'#'))
+            .from_reader(io::Cursor::new(data))
+            .into_deserialize::<Row>();
+
+        let row = rows.next().unwrap().unwrap();
+        assert_eq!(row, Row { name: "a\nb".into(), value: 1 });
+        let row = rows.next().unwrap().unwrap();
+        assert_eq!(row, Row { name: "c".into(), value: 2 });
+
+        // The numeric mapping failure carries the position of the record.
+        let err = rows.next().unwrap().unwrap_err();
+        match *err.kind() {
+            ErrorKind::Deserialize { ref pos, .. } => {
+                assert_eq!(&Some(newpos(17, 3, 2)), pos);
+            }
+            ref x => panic!("expected Deserialize, got {:?}", x),
+        }
+
+        let row = rows.next().unwrap().unwrap();
+        assert_eq!(row, Row { name: "e".into(), value: 4 });
+        assert!(rows.next().is_none());
+    }
+
     // Test that reading headers on empty data yields an empty record.
     #[test]
     fn headers_on_empty_data() {
