@@ -29,6 +29,7 @@ pub struct ReaderBuilder {
     flexible: bool,
     has_headers: bool,
     trim: Trim,
+    continue_on_would_block: bool,
     /// The underlying CSV parser builder.
     ///
     /// We explicitly put this on the heap because CoreReaderBuilder embeds an
@@ -44,6 +45,7 @@ impl Default for ReaderBuilder {
             flexible: false,
             has_headers: true,
             trim: Trim::default(),
+            continue_on_would_block: false,
             builder: Box::new(CoreReaderBuilder::default()),
         }
     }
@@ -309,6 +311,123 @@ impl ReaderBuilder {
     pub fn flexible(&mut self, yes: bool) -> &mut ReaderBuilder {
         self.flexible = yes;
         self
+    }
+
+    /// Whether to allow reading to continue after the underlying reader
+    /// reports that no data is temporarily available.
+    ///
+    /// This is disabled by default. When disabled, any I/O error from the
+    /// underlying reader (including an error of kind
+    /// `std::io::ErrorKind::WouldBlock`) is returned to the caller and the
+    /// reader behaves as if end of file had been reached on subsequent
+    /// calls.
+    ///
+    /// When enabled, an I/O error of kind `std::io::ErrorKind::WouldBlock`
+    /// is returned to the caller like any other error, but the reader does
+    /// *not* consider itself done: `is_done` keeps returning `false` and any
+    /// data already read for the current record is kept. The current call
+    /// ends immediately (iterators yield `Some(Err(...))` for it), and the
+    /// next call resumes reading the very same record right where it left
+    /// off. This makes it possible to use a single `Reader` with an
+    /// underlying source that delivers data in batches, such as a
+    /// non-blocking socket or pipe.
+    ///
+    /// Note that only `WouldBlock` errors are treated this way. Any other
+    /// I/O error retains the default behavior of stopping the reader, and a
+    /// read that returns zero bytes is still treated as end of file.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::{error::Error, io};
+    /// use csv::ReaderBuilder;
+    ///
+    /// // A reader that is temporarily out of data on every other call.
+    /// struct Trickle {
+    ///     data: &'static [u8],
+    ///     blocked: bool,
+    /// }
+    ///
+    /// impl io::Read for Trickle {
+    ///     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    ///         if self.blocked {
+    ///             self.blocked = false;
+    ///             return Err(io::Error::new(
+    ///                 io::ErrorKind::WouldBlock, "no data yet"));
+    ///         }
+    ///         self.blocked = true;
+    ///         let n = self.data.len().min(buf.len());
+    ///         buf[..n].copy_from_slice(&self.data[..n]);
+    ///         self.data = &self.data[n..];
+    ///         Ok(n)
+    ///     }
+    /// }
+    ///
+    /// # fn main() { example().unwrap(); }
+    /// fn example() -> Result<(), Box<dyn Error>> {
+    ///     let mut rdr = ReaderBuilder::new()
+    ///         .continue_on_would_block(true)
+    ///         .from_reader(Trickle {
+    ///             data: b"city,country\nBoston,United States\n",
+    ///             blocked: false,
+    ///         });
+    ///     let mut records = vec![];
+    ///     let mut record = csv::StringRecord::new();
+    ///     loop {
+    ///         match rdr.read_record(&mut record) {
+    ///             Ok(true) => records.push(record.clone()),
+    ///             Ok(false) => break,
+    ///             // Temporarily no data: try again later.
+    ///             Err(_) => continue,
+    ///         }
+    ///     }
+    ///     assert_eq!(records, vec![vec!["Boston", "United States"]]);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn continue_on_would_block(
+        &mut self,
+        yes: bool,
+    ) -> &mut ReaderBuilder {
+        self.continue_on_would_block = yes;
+        self
+    }
+
+    /// Whether to allow reading to continue after the underlying reader
+    /// reports that no data is temporarily available.
+    ///
+    /// This is an alias for
+    /// [`continue_on_would_block`](ReaderBuilder::continue_on_would_block).
+    pub fn resume_on_would_block(&mut self, yes: bool) -> &mut ReaderBuilder {
+        self.continue_on_would_block(yes)
+    }
+
+    /// Whether to allow reading to continue after the underlying reader
+    /// reports that no data is temporarily available.
+    ///
+    /// This is an alias for
+    /// [`continue_on_would_block`](ReaderBuilder::continue_on_would_block).
+    pub fn would_block_resume(&mut self, yes: bool) -> &mut ReaderBuilder {
+        self.continue_on_would_block(yes)
+    }
+
+    /// Whether to allow reading to continue after the underlying reader
+    /// reports that no data is temporarily available.
+    ///
+    /// This is an alias for
+    /// [`continue_on_would_block`](ReaderBuilder::continue_on_would_block).
+    pub fn allow_would_block(&mut self, yes: bool) -> &mut ReaderBuilder {
+        self.continue_on_would_block(yes)
+    }
+
+    /// Whether to treat the underlying reader as non-blocking, i.e. to
+    /// allow reading to continue after it reports that no data is
+    /// temporarily available.
+    ///
+    /// This is an alias for
+    /// [`continue_on_would_block`](ReaderBuilder::continue_on_would_block).
+    pub fn nonblocking(&mut self, yes: bool) -> &mut ReaderBuilder {
+        self.continue_on_would_block(yes)
     }
 
     /// Whether fields are trimmed of leading and trailing whitespace or not.
@@ -695,7 +814,12 @@ impl ReaderBuilder {
 ///   For subsequent calls to the `Reader` after encountering a such error
 ///   (unless `seek` is used), it will behave as if end of file had been
 ///   reached, in order to avoid running into infinite loops when still
-///   attempting to read the next record when one has errored.
+///   attempting to read the next record when one has errored. As an
+///   exception, when `continue_on_would_block` is enabled via a
+///   [`ReaderBuilder`](struct.ReaderBuilder.html), an I/O error of kind
+///   `std::io::ErrorKind::WouldBlock` is returned to the caller without
+///   stopping the reader: the current record is kept and the next call
+///   resumes reading it where it left off.
 /// * When reading CSV data into `String` or `&str` fields (e.g., via a
 ///   [`StringRecord`](struct.StringRecord.html)), UTF-8 is strictly
 ///   enforced. If CSV data is invalid UTF-8, then an error is returned. If
@@ -762,6 +886,20 @@ struct ReaderState {
     /// an IO error.
     /// This has no additional runtime cost.
     eof: ReaderEofState,
+    /// Whether an I/O error of kind `WouldBlock` from the underlying reader
+    /// should be handed back to the caller while keeping the ability to
+    /// resume reading the current record later.
+    ///
+    /// When this is disabled (the default), any I/O error stops the reader
+    /// as described above.
+    continue_on_would_block: bool,
+    /// The partially read record, if reading was interrupted by a
+    /// `WouldBlock` I/O error.
+    ///
+    /// This is only ever populated when `continue_on_would_block` is
+    /// enabled. The next read resumes this record instead of starting a new
+    /// one, so no data is lost, duplicated or delivered early.
+    interrupted: Option<InterruptedRecord>,
 }
 
 /// Whether EOF of the underlying reader has been reached or not.
@@ -779,6 +917,37 @@ enum ReaderEofState {
     NotEof,
     Eof,
     IOError,
+}
+
+/// The state of a record whose reading was interrupted by a `WouldBlock`
+/// I/O error from the underlying reader.
+///
+/// The record's data is kept here (rather than in the caller's record) so
+/// that the caller is free to pass a different record object—or switch
+/// between byte and string records—on the next read. The record's position
+/// inside `record` is the position of the start of the interrupted record.
+#[derive(Debug)]
+struct InterruptedRecord {
+    /// The partially read record, including the position of the start of
+    /// the record.
+    record: ByteRecord,
+    /// The number of bytes of field data written to `record` so far.
+    outlen: usize,
+    /// The number of field end positions written to `record` so far.
+    endlen: usize,
+    /// The number of input bytes consumed by the parser for this record so
+    /// far. This is folded into the reader's position once the record
+    /// completes (or end of file is reached), so that the reader's position
+    /// always points at the start of a record between calls.
+    nin: u64,
+}
+
+/// Returns true if the given error is an I/O error of kind `WouldBlock`.
+fn is_would_block(err: &Error) -> bool {
+    matches!(
+        *err.kind(),
+        ErrorKind::Io(ref ioe) if ioe.kind() == io::ErrorKind::WouldBlock
+    )
 }
 
 /// Headers encapsulates any data associated with the headers of CSV data.
@@ -836,6 +1005,8 @@ impl<R: io::Read> Reader<R> {
                 first: false,
                 seeked: false,
                 eof: ReaderEofState::NotEof,
+                continue_on_would_block: builder.continue_on_would_block,
+                interrupted: None,
             },
         }
     }
@@ -1627,14 +1798,50 @@ impl<R: io::Read> Reader<R> {
         if self.state.eof != ReaderEofState::NotEof {
             return Ok(false);
         }
-        let (mut outlen, mut endlen) = (0, 0);
+        let (mut outlen, mut endlen, mut nin_total) = (0, 0, 0);
+        if self.state.continue_on_would_block {
+            // If the previous read was interrupted by a `WouldBlock` error,
+            // then resume the interrupted record: its data becomes the
+            // caller's record again (along with the position of the start of
+            // the record, which it kept) and parsing continues where it left
+            // off.
+            if let Some(interrupted) = self.state.interrupted.take() {
+                let mut saved = interrupted.record;
+                std::mem::swap(record, &mut saved);
+                outlen = interrupted.outlen;
+                endlen = interrupted.endlen;
+                nin_total = interrupted.nin;
+            }
+        }
         loop {
             let (res, nin, nout, nend) = {
-                let input_res = self.rdr.fill_buf();
-                if input_res.is_err() {
-                    self.state.eof = ReaderEofState::IOError;
-                }
-                let input = input_res?;
+                let input = match self.rdr.fill_buf() {
+                    Ok(input) => input,
+                    Err(err) => {
+                        if self.state.continue_on_would_block
+                            && err.kind() == io::ErrorKind::WouldBlock
+                        {
+                            // Temporarily no data: stash the partially read
+                            // record so that the next call can resume it, and
+                            // hand the I/O error back to the caller. The
+                            // caller's record is left empty, but keeps the
+                            // position of the start of the record.
+                            let pos = record.position().cloned();
+                            let mut saved = ByteRecord::new();
+                            std::mem::swap(record, &mut saved);
+                            record.set_position(pos);
+                            self.state.interrupted = Some(InterruptedRecord {
+                                record: saved,
+                                outlen,
+                                endlen,
+                                nin: nin_total,
+                            });
+                            return Err(Error::from(err));
+                        }
+                        self.state.eof = ReaderEofState::IOError;
+                        return Err(Error::from(err));
+                    }
+                };
                 let (fields, ends) = record.as_parts();
                 self.core.read_record(
                     input,
@@ -1643,11 +1850,14 @@ impl<R: io::Read> Reader<R> {
                 )
             };
             self.rdr.consume(nin);
-            let byte = self.state.cur_pos.byte();
-            self.state
-                .cur_pos
-                .set_byte(byte + nin as u64)
-                .set_line(self.core.line());
+            nin_total += nin as u64;
+            if !self.state.continue_on_would_block {
+                let byte = self.state.cur_pos.byte();
+                self.state
+                    .cur_pos
+                    .set_byte(byte + nin as u64)
+                    .set_line(self.core.line());
+            }
             outlen += nout;
             endlen += nend;
             match res {
@@ -1661,16 +1871,46 @@ impl<R: io::Read> Reader<R> {
                     continue;
                 }
                 Record => {
+                    if self.state.continue_on_would_block {
+                        self.advance_pos_after_resumed(record, nin_total);
+                    }
                     record.set_len(endlen);
                     self.state.add_record(record)?;
                     return Ok(true);
                 }
                 End => {
+                    if self.state.continue_on_would_block {
+                        self.advance_pos_after_resumed(record, nin_total);
+                    }
                     self.state.eof = ReaderEofState::Eof;
                     return Ok(false);
                 }
             }
         }
+    }
+
+    /// Fold the input bytes consumed for a (possibly interrupted and
+    /// resumed) record into the reader's current position.
+    ///
+    /// While `continue_on_would_block` is enabled, the reader's position is
+    /// only advanced once a record completes (or end of file is reached), so
+    /// that it always points at the start of a record between calls.
+    /// `record` carries the position of the start of the record and
+    /// `nin_total` is the number of input bytes consumed for it so far.
+    #[inline(always)]
+    fn advance_pos_after_resumed(
+        &mut self,
+        record: &ByteRecord,
+        nin_total: u64,
+    ) {
+        let start = record
+            .position()
+            .cloned()
+            .unwrap_or_else(|| self.state.cur_pos.clone());
+        self.state
+            .cur_pos
+            .set_byte(start.byte() + nin_total)
+            .set_line(self.core.line());
     }
 
     /// Return the current position of this CSV reader.
@@ -1848,6 +2088,7 @@ impl<R: io::Read + io::Seek> Reader<R> {
         self.core.set_line(pos.line());
         self.state.cur_pos = pos;
         self.state.eof = ReaderEofState::NotEof;
+        self.state.interrupted = None;
         Ok(())
     }
 
@@ -1879,6 +2120,7 @@ impl<R: io::Read + io::Seek> Reader<R> {
         self.core.set_line(pos.line());
         self.state.cur_pos = pos;
         self.state.eof = ReaderEofState::NotEof;
+        self.state.interrupted = None;
         Ok(())
     }
 }
@@ -1914,20 +2156,35 @@ pub struct DeserializeRecordsIntoIter<R, D> {
     rdr: Reader<R>,
     rec: StringRecord,
     headers: Option<StringRecord>,
+    /// Whether reading the header row was interrupted by a `WouldBlock` I/O
+    /// error and still needs to be retried. While this is set, the iterator
+    /// surfaces header errors instead of falling back to deserializing by
+    /// field order.
+    headers_pending: bool,
     _priv: PhantomData<D>,
 }
 
 impl<R: io::Read, D: DeserializeOwned> DeserializeRecordsIntoIter<R, D> {
     fn new(mut rdr: Reader<R>) -> DeserializeRecordsIntoIter<R, D> {
-        let headers = if !rdr.state.has_headers {
-            None
-        } else {
-            rdr.headers().ok().cloned()
-        };
+        let (mut headers, mut headers_pending) = (None, false);
+        let resumable = rdr.state.continue_on_would_block;
+        if rdr.state.has_headers {
+            match rdr.headers() {
+                Ok(h) => headers = Some(h.clone()),
+                // If the header row is temporarily unavailable, retry it on
+                // the next call rather than caching a partial header or
+                // falling back to deserializing by field order.
+                Err(ref err) if resumable && is_would_block(err) => {
+                    headers_pending = true;
+                }
+                Err(_) => {}
+            }
+        }
         DeserializeRecordsIntoIter {
             rdr,
             rec: StringRecord::new(),
             headers,
+            headers_pending,
             _priv: PhantomData,
         }
     }
@@ -1954,6 +2211,22 @@ impl<R: io::Read, D: DeserializeOwned> Iterator
     type Item = Result<D>;
 
     fn next(&mut self) -> Option<Result<D>> {
+        if self.headers_pending {
+            match self.rdr.headers() {
+                Ok(headers) => {
+                    self.headers = Some(headers.clone());
+                    self.headers_pending = false;
+                }
+                Err(err) => {
+                    if is_would_block(&err) {
+                        return Some(Err(err));
+                    }
+                    // Any other error retains the usual behavior of
+                    // deserializing without headers.
+                    self.headers_pending = false;
+                }
+            }
+        }
         match self.rdr.read_record(&mut self.rec) {
             Err(err) => Some(Err(err)),
             Ok(false) => None,
@@ -1972,20 +2245,35 @@ pub struct DeserializeRecordsIter<'r, R: 'r, D> {
     rdr: &'r mut Reader<R>,
     rec: StringRecord,
     headers: Option<StringRecord>,
+    /// Whether reading the header row was interrupted by a `WouldBlock` I/O
+    /// error and still needs to be retried. While this is set, the iterator
+    /// surfaces header errors instead of falling back to deserializing by
+    /// field order.
+    headers_pending: bool,
     _priv: PhantomData<D>,
 }
 
 impl<'r, R: io::Read, D: DeserializeOwned> DeserializeRecordsIter<'r, R, D> {
     fn new(rdr: &'r mut Reader<R>) -> DeserializeRecordsIter<'r, R, D> {
-        let headers = if !rdr.state.has_headers {
-            None
-        } else {
-            rdr.headers().ok().cloned()
-        };
+        let (mut headers, mut headers_pending) = (None, false);
+        let resumable = rdr.state.continue_on_would_block;
+        if rdr.state.has_headers {
+            match rdr.headers() {
+                Ok(h) => headers = Some(h.clone()),
+                // If the header row is temporarily unavailable, retry it on
+                // the next call rather than caching a partial header or
+                // falling back to deserializing by field order.
+                Err(ref err) if resumable && is_would_block(err) => {
+                    headers_pending = true;
+                }
+                Err(_) => {}
+            }
+        }
         DeserializeRecordsIter {
             rdr,
             rec: StringRecord::new(),
             headers,
+            headers_pending,
             _priv: PhantomData,
         }
     }
@@ -2007,6 +2295,22 @@ impl<'r, R: io::Read, D: DeserializeOwned> Iterator
     type Item = Result<D>;
 
     fn next(&mut self) -> Option<Result<D>> {
+        if self.headers_pending {
+            match self.rdr.headers() {
+                Ok(headers) => {
+                    self.headers = Some(headers.clone());
+                    self.headers_pending = false;
+                }
+                Err(err) => {
+                    if is_would_block(&err) {
+                        return Some(Err(err));
+                    }
+                    // Any other error retains the usual behavior of
+                    // deserializing without headers.
+                    self.headers_pending = false;
+                }
+            }
+        }
         match self.rdr.read_record(&mut self.rec) {
             Err(err) => Some(Err(err)),
             Ok(false) => None,
@@ -2641,5 +2945,609 @@ mod tests {
             ReaderBuilder::new().has_headers(false).from_reader("".as_bytes());
         assert_eq!(rdr.headers().unwrap().len(), 0);
         assert_eq!(rdr.records().count(), 0);
+    }
+
+    /// A script of actions for `Scripted`.
+    #[derive(Clone, Copy, Debug)]
+    enum Action {
+        /// Return a `WouldBlock` error.
+        Block,
+        /// Deliver up to this many bytes of data.
+        Give(usize),
+        /// Return an I/O error that is not `WouldBlock`.
+        Fail,
+    }
+
+    /// A reader that delivers its data according to a script, permitting
+    /// tests to interleave `WouldBlock` errors with data delivery. Once the
+    /// script is exhausted, any remaining data is delivered normally.
+    struct Scripted {
+        data: Vec<u8>,
+        pos: usize,
+        script: std::collections::VecDeque<Action>,
+    }
+
+    impl Scripted {
+        fn new(data: &[u8], script: Vec<Action>) -> Scripted {
+            Scripted {
+                data: data.to_vec(),
+                pos: 0,
+                script: script.into_iter().collect(),
+            }
+        }
+    }
+
+    impl io::Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let give = match self.script.pop_front() {
+                Some(Action::Block) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "no data yet",
+                    ));
+                }
+                Some(Action::Give(n)) => n,
+                Some(Action::Fail) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "reader is broken",
+                    ));
+                }
+                None => self.data.len() - self.pos,
+            };
+            let remaining = &self.data[self.pos..];
+            let n = give.min(remaining.len()).min(buf.len());
+            buf[..n].copy_from_slice(&remaining[..n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    /// Build a reader with `continue_on_would_block` enabled over scripted
+    /// data delivery.
+    fn resumable_reader(
+        data: &[u8],
+        script: Vec<Action>,
+    ) -> super::Reader<Scripted> {
+        ReaderBuilder::new()
+            .has_headers(false)
+            .continue_on_would_block(true)
+            .from_reader(Scripted::new(data, script))
+    }
+
+    /// A script that delivers one byte at a time, with a `WouldBlock` error
+    /// between every pair of deliveries.
+    fn one_byte_script(len: usize) -> Vec<Action> {
+        let mut script = vec![];
+        for _ in 0..len {
+            script.push(Action::Give(1));
+            script.push(Action::Block);
+        }
+        script
+    }
+
+    fn assert_would_block(err: &crate::Error) {
+        match *err.kind() {
+            ErrorKind::Io(ref ioe) => {
+                assert_eq!(io::ErrorKind::WouldBlock, ioe.kind());
+            }
+            ref wrong => {
+                panic!("expected WouldBlock I/O error, got {:?}", wrong)
+            }
+        }
+    }
+
+    /// Read all remaining byte records, retrying on `WouldBlock` errors.
+    /// After every `WouldBlock` error, the record must be empty and the
+    /// reader must not be done.
+    fn collect_resumable(
+        rdr: &mut super::Reader<Scripted>,
+    ) -> Vec<ByteRecord> {
+        let mut records = vec![];
+        let mut rec = ByteRecord::new();
+        loop {
+            match rdr.read_byte_record(&mut rec) {
+                Ok(true) => records.push(rec.clone()),
+                Ok(false) => break,
+                Err(err) => {
+                    assert_would_block(&err);
+                    assert!(!rdr.is_done());
+                    assert!(rec.is_empty());
+                }
+            }
+        }
+        records
+    }
+
+    fn fields_of(records: &[ByteRecord]) -> Vec<Vec<Vec<u8>>> {
+        records
+            .iter()
+            .map(|rec| rec.iter().map(|f| f.to_vec()).collect())
+            .collect()
+    }
+
+    fn positions_of(records: &[ByteRecord]) -> Vec<Position> {
+        records.iter().map(|rec| rec.position().unwrap().clone()).collect()
+    }
+
+    // When the feature is not enabled, a `WouldBlock` error keeps the
+    // traditional behavior: the error is returned and the reader stops.
+    #[test]
+    fn would_block_disabled_stops_reading() {
+        let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(
+            Scripted::new(
+                b("a,b\nc,d\n"),
+                vec![Action::Give(2), Action::Block],
+            ),
+        );
+        let mut rec = ByteRecord::new();
+
+        let err = rdr.read_byte_record(&mut rec).unwrap_err();
+        assert_would_block(&err);
+        assert!(rdr.is_done());
+        // Subsequent reads behave as if EOF had been reached.
+        assert!(!rdr.read_byte_record(&mut rec).unwrap());
+    }
+
+    // A `WouldBlock` error is handed back to the caller, the record is left
+    // empty with the position of the start of the record, and the next call
+    // resumes the very same record.
+    #[test]
+    fn would_block_resumes_record() {
+        let mut rdr = resumable_reader(
+            b("a,b\nc,d\n"),
+            vec![Action::Give(2), Action::Block],
+        );
+        let mut rec = ByteRecord::new();
+
+        let err = rdr.read_byte_record(&mut rec).unwrap_err();
+        assert_would_block(&err);
+        assert!(!rdr.is_done());
+        assert!(rec.is_empty());
+        assert_eq!(rec.position(), Some(&newpos(0, 1, 0)));
+        assert_eq!(rdr.position(), &newpos(0, 1, 0));
+
+        assert!(rdr.read_byte_record(&mut rec).unwrap());
+        assert_eq!("a", s(&rec[0]));
+        assert_eq!("b", s(&rec[1]));
+        assert_eq!(rec.position(), Some(&newpos(0, 1, 0)));
+        assert_eq!(rdr.position(), &newpos(4, 2, 1));
+
+        assert!(rdr.read_byte_record(&mut rec).unwrap());
+        assert_eq!("c", s(&rec[0]));
+        assert_eq!("d", s(&rec[1]));
+        assert_eq!(rec.position(), Some(&newpos(4, 2, 1)));
+
+        assert!(!rdr.read_byte_record(&mut rec).unwrap());
+        assert!(rdr.is_done());
+    }
+
+    // Any number of `WouldBlock` errors in a row are each handed back to
+    // the caller without losing, duplicating or skipping any content.
+    #[test]
+    fn would_block_repeated_errors() {
+        let mut rdr = resumable_reader(
+            b("x,y\n"),
+            vec![
+                Action::Block,
+                Action::Give(1),
+                Action::Block,
+                Action::Block,
+                Action::Give(1),
+                Action::Block,
+            ],
+        );
+        assert_eq!(
+            fields_of(&collect_resumable(&mut rdr)),
+            vec![vec![b("x").to_vec(), b("y").to_vec()],]
+        );
+        assert!(rdr.is_done());
+    }
+
+    // Data delivered one byte at a time with a `WouldBlock` error between
+    // every pair of deliveries produces exactly the same records and
+    // positions as uninterrupted reading. The data exercises pauses in the
+    // middle of the UTF-8 BOM, inside quoted fields (around an embedded
+    // line feed and a pair of quotes), between CR and LF, in the middle of
+    // a multi-byte character and in a final record without a terminator.
+    #[test]
+    fn would_block_one_byte_at_a_time_equivalent() {
+        let data: &[u8] =
+            "\u{FEFF}name,note,score\n\"甲\n乙\",\"x\"\"y\",1\r\nplain,\"a,b\",2\nlast,no,term".as_bytes();
+
+        let mut reference = ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(io::Cursor::new(data.to_vec()));
+        let mut expected = vec![];
+        let mut rec = ByteRecord::new();
+        while reference.read_byte_record(&mut rec).unwrap() {
+            expected.push(rec.clone());
+        }
+
+        let mut rdr = resumable_reader(data, one_byte_script(data.len()));
+        let got = collect_resumable(&mut rdr);
+
+        assert_eq!(fields_of(&got), fields_of(&expected));
+        assert_eq!(positions_of(&got), positions_of(&expected));
+        assert_eq!(rdr.position(), reference.position());
+        assert!(rdr.is_done());
+    }
+
+    // The same equivalence holds for string records: temporarily incomplete
+    // multi-byte characters are never reported as UTF-8 errors.
+    #[test]
+    fn would_block_one_byte_at_a_time_equivalent_strings() {
+        let data: &[u8] =
+            "\u{FEFF}name,note\n\"甲\n乙\",\"x\"\"y\"\r\nplain,中文\n"
+                .as_bytes();
+
+        let mut reference = ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(io::Cursor::new(data.to_vec()));
+        let mut expected = vec![];
+        let mut rec = StringRecord::new();
+        while reference.read_record(&mut rec).unwrap() {
+            expected.push(rec.clone());
+        }
+
+        let mut rdr = resumable_reader(data, one_byte_script(data.len()));
+        let mut got = vec![];
+        let mut rec = StringRecord::new();
+        loop {
+            match rdr.read_record(&mut rec) {
+                Ok(true) => got.push(rec.clone()),
+                Ok(false) => break,
+                Err(err) => {
+                    assert_would_block(&err);
+                    assert!(rec.is_empty());
+                }
+            }
+        }
+        assert_eq!(got, expected);
+        assert!(rdr.is_done());
+    }
+
+    // A pause can happen while the UTF-8 byte order mark at the start of
+    // the file has only been partially delivered.
+    #[test]
+    fn would_block_mid_bom() {
+        let mut rdr = resumable_reader(
+            b"\xEF\xBB\xBFa,b\n",
+            vec![
+                Action::Give(1),
+                Action::Block,
+                Action::Give(1),
+                Action::Block,
+            ],
+        );
+        assert_eq!(
+            fields_of(&collect_resumable(&mut rdr)),
+            vec![vec![b("a").to_vec(), b("b").to_vec()],]
+        );
+    }
+
+    // A pause between CR and LF does not produce a spurious empty record.
+    #[test]
+    fn would_block_between_cr_and_lf() {
+        let mut rdr = resumable_reader(
+            b("a\r\nb\n"),
+            vec![Action::Give(2), Action::Block],
+        );
+        let mut rec = ByteRecord::new();
+
+        // The record ends as soon as CR is seen.
+        assert!(rdr.read_byte_record(&mut rec).unwrap());
+        assert_eq!("a", s(&rec[0]));
+
+        // The pause happens while the LF is being absorbed.
+        let err = rdr.read_byte_record(&mut rec).unwrap_err();
+        assert_would_block(&err);
+
+        assert!(rdr.read_byte_record(&mut rec).unwrap());
+        assert_eq!("b", s(&rec[0]));
+        assert!(!rdr.read_byte_record(&mut rec).unwrap());
+    }
+
+    // The caller is free to use a different record object, or to switch
+    // between byte and string records, after a `WouldBlock` error.
+    #[test]
+    fn would_block_switch_record_and_interface() {
+        let mut rdr = resumable_reader(
+            b("a,b\nc,d\n"),
+            vec![
+                Action::Give(2),
+                Action::Block,
+                Action::Give(2),
+                Action::Block,
+            ],
+        );
+
+        let mut rec1 = ByteRecord::new();
+        let err = rdr.read_byte_record(&mut rec1).unwrap_err();
+        assert_would_block(&err);
+        assert!(rec1.is_empty());
+
+        // A different record object still gets the complete record.
+        let mut rec2 = ByteRecord::new();
+        assert!(rdr.read_byte_record(&mut rec2).unwrap());
+        assert_eq!("a", s(&rec2[0]));
+        assert_eq!("b", s(&rec2[1]));
+
+        // Switching from byte to string reading keeps the paused content.
+        let mut srec = StringRecord::new();
+        let err = rdr.read_record(&mut srec).unwrap_err();
+        assert_would_block(&err);
+        assert!(srec.is_empty());
+        assert_eq!(srec.position(), Some(&newpos(4, 2, 1)));
+
+        assert!(rdr.read_record(&mut srec).unwrap());
+        assert_eq!(srec, vec!["c", "d"]);
+        assert!(!rdr.read_record(&mut srec).unwrap());
+    }
+
+    // A pause can also happen while reading the first data record, right
+    // after the header row was completed within the same read call.
+    #[test]
+    fn would_block_between_header_and_first_record() {
+        let mut rdr = ReaderBuilder::new()
+            .continue_on_would_block(true)
+            .from_reader(Scripted::new(
+                b("h1,h2\na,b\n"),
+                vec![Action::Give(6), Action::Block],
+            ));
+        let mut rec = StringRecord::new();
+
+        let err = rdr.read_record(&mut rec).unwrap_err();
+        assert_would_block(&err);
+        assert!(rec.is_empty());
+        assert_eq!(rec.position(), Some(&newpos(6, 2, 1)));
+
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rec, vec!["a", "b"]);
+        assert_eq!(rec.position(), Some(&newpos(6, 2, 1)));
+        assert!(!rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rdr.headers().unwrap(), vec!["h1", "h2"]);
+    }
+
+    // A record that is genuinely invalid UTF-8 keeps its raw bytes on the
+    // byte interface and reports the usual UTF-8 error on the string
+    // interface, with the same field number, in-field offset and record
+    // position as uninterrupted reading. Reading can continue afterwards.
+    #[test]
+    fn would_block_invalid_utf8() {
+        let data = &b"a,\xFF\nb,c\n"[..];
+        let script = vec![
+            Action::Give(2),
+            Action::Block,
+            Action::Give(1),
+            Action::Block,
+        ];
+
+        let mut rdr = resumable_reader(data, script.clone());
+        let mut rec = ByteRecord::new();
+        loop {
+            match rdr.read_byte_record(&mut rec) {
+                Ok(true) => break,
+                Ok(false) => panic!("expected a record"),
+                Err(err) => assert_would_block(&err),
+            }
+        }
+        assert_eq!(&rec[0], b("a"));
+        assert_eq!(&rec[1], &b"\xFF"[..]);
+
+        let mut rdr = resumable_reader(data, script);
+        let mut rec = StringRecord::new();
+        let err = loop {
+            match rdr.read_record(&mut rec) {
+                Ok(_) => panic!("expected a UTF-8 error"),
+                Err(err) if super::is_would_block(&err) => continue,
+                Err(err) => break err,
+            }
+        };
+        match *err.kind() {
+            ErrorKind::Utf8 { pos: Some(ref pos), ref err } => {
+                assert_eq!(pos, &newpos(0, 1, 0));
+                assert_eq!(err.field(), 1);
+                assert_eq!(err.valid_up_to(), 0);
+            }
+            ref wrong => panic!("match failed, got {:?}", wrong),
+        }
+        // The next record can still be read.
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rec, vec!["b", "c"]);
+        assert!(!rdr.read_record(&mut rec).unwrap());
+    }
+
+    // A pause while reading the header row does not cache a partial header,
+    // and the header row is still not returned as a data record.
+    #[test]
+    fn would_block_headers_not_cached_partial() {
+        let mut rdr = ReaderBuilder::new()
+            .continue_on_would_block(true)
+            .from_reader(Scripted::new(
+                b("h1,h2\na,b\n"),
+                vec![Action::Give(2), Action::Block],
+            ));
+
+        let err = rdr.headers().unwrap_err();
+        assert_would_block(&err);
+
+        // Retrying reads the complete header row.
+        assert_eq!(rdr.headers().unwrap(), vec!["h1", "h2"]);
+
+        // The header row is not returned as a data record.
+        let mut rec = StringRecord::new();
+        assert!(rdr.read_record(&mut rec).unwrap());
+        assert_eq!(rec, vec!["a", "b"]);
+        assert!(!rdr.read_record(&mut rec).unwrap());
+    }
+
+    #[derive(Debug, serde::Deserialize, PartialEq)]
+    struct Row {
+        city: String,
+        pop: u64,
+    }
+
+    // The Serde iterators deliver the `WouldBlock` error and, once the
+    // complete header row is available, deserialize by header name (the
+    // header order here differs from the struct field order, so positional
+    // deserialization would fail).
+    #[test]
+    fn would_block_deserialize_retries_headers() {
+        let script = vec![Action::Give(2), Action::Block, Action::Block];
+        let data = b("pop,city\n1,Boston\n2,Concord\n");
+        let expected = vec![
+            Row { city: "Boston".to_string(), pop: 1 },
+            Row { city: "Concord".to_string(), pop: 2 },
+        ];
+
+        // Borrowed iterator.
+        let mut rdr = ReaderBuilder::new()
+            .continue_on_would_block(true)
+            .from_reader(Scripted::new(data, script.clone()));
+        let mut iter = rdr.deserialize::<Row>();
+        let err = iter.next().unwrap().unwrap_err();
+        assert_would_block(&err);
+        let mut got = vec![];
+        for result in iter {
+            got.push(result.unwrap());
+        }
+        assert_eq!(got, expected);
+
+        // Owned iterator.
+        let rdr = ReaderBuilder::new()
+            .continue_on_would_block(true)
+            .from_reader(Scripted::new(data, script));
+        let mut iter = rdr.into_deserialize::<Row>();
+        let err = iter.next().unwrap().unwrap_err();
+        assert_would_block(&err);
+        let mut got = vec![];
+        for result in iter {
+            got.push(result.unwrap());
+        }
+        assert_eq!(got, expected);
+    }
+
+    // Deserializing one byte at a time produces the same values as
+    // uninterrupted reading.
+    #[test]
+    fn would_block_deserialize_one_byte_at_a_time() {
+        let data = b("city,country,pop\nBoston,United States,4628910\nConcord,United States,42695\n");
+
+        #[derive(Debug, serde::Deserialize, PartialEq)]
+        struct Full {
+            city: String,
+            country: String,
+            pop: u64,
+        }
+
+        let mut reference = ReaderBuilder::new()
+            .from_reader(io::Cursor::new(data.to_vec()))
+            .into_deserialize::<Full>();
+        let expected: Vec<Full> = reference.map(|r| r.unwrap()).collect();
+
+        let rdr = ReaderBuilder::new()
+            .continue_on_would_block(true)
+            .from_reader(Scripted::new(data, one_byte_script(data.len())));
+        let mut iter = rdr.into_deserialize::<Full>();
+        let mut got = vec![];
+        loop {
+            match iter.next() {
+                Some(Ok(row)) => got.push(row),
+                Some(Err(err)) => assert_would_block(&err),
+                None => break,
+            }
+        }
+        assert_eq!(got, expected);
+        assert!(iter.reader().is_done());
+    }
+
+    // Dropping a borrowed iterator while a record is paused and creating a
+    // new one does not lose the paused content.
+    #[test]
+    fn would_block_iter_drop_recreate() {
+        let mut rdr =
+            resumable_reader(b("a,b\n"), vec![Action::Give(2), Action::Block]);
+        {
+            let mut iter = rdr.byte_records();
+            let err = iter.next().unwrap().unwrap_err();
+            assert_would_block(&err);
+        }
+        {
+            let mut iter = rdr.records();
+            let rec = iter.next().unwrap().unwrap();
+            assert_eq!(rec, vec!["a", "b"]);
+            assert!(iter.next().is_none());
+        }
+        assert!(rdr.is_done());
+    }
+
+    // A final record without a trailing terminator is returned exactly
+    // once; only a genuine zero-byte read ends the reader.
+    #[test]
+    fn would_block_final_record_without_terminator() {
+        let mut rdr =
+            resumable_reader(b("a,b"), vec![Action::Give(3), Action::Block]);
+        let mut rec = ByteRecord::new();
+
+        let err = rdr.read_byte_record(&mut rec).unwrap_err();
+        assert_would_block(&err);
+
+        assert!(rdr.read_byte_record(&mut rec).unwrap());
+        assert_eq!("a", s(&rec[0]));
+        assert_eq!("b", s(&rec[1]));
+
+        assert!(!rdr.read_byte_record(&mut rec).unwrap());
+        assert!(!rdr.read_byte_record(&mut rec).unwrap());
+        assert!(rdr.is_done());
+    }
+
+    // The field count check still applies to records read across pauses.
+    #[test]
+    fn would_block_unequal_lengths() {
+        let mut rdr = resumable_reader(
+            b("foo\nbar,baz\n"),
+            vec![Action::Give(5), Action::Block],
+        );
+        let mut rec = ByteRecord::new();
+
+        assert!(rdr.read_byte_record(&mut rec).unwrap());
+        assert_eq!("foo", s(&rec[0]));
+
+        let err = rdr.read_byte_record(&mut rec).unwrap_err();
+        assert_would_block(&err);
+
+        match rdr.read_byte_record(&mut rec) {
+            Err(err) => match *err.kind() {
+                ErrorKind::UnequalLengths {
+                    expected_len: 1,
+                    ref pos,
+                    len: 2,
+                } => {
+                    assert_eq!(pos, &Some(newpos(4, 2, 1)));
+                }
+                ref wrong => panic!("match failed, got {:?}", wrong),
+            },
+            wrong => panic!("match failed, got {:?}", wrong),
+        }
+    }
+
+    // I/O errors other than `WouldBlock` keep the stop-reading behavior
+    // even when the feature is enabled.
+    #[test]
+    fn would_block_other_io_error_stops() {
+        let mut rdr =
+            resumable_reader(b("a,b\n"), vec![Action::Give(2), Action::Fail]);
+        let mut rec = ByteRecord::new();
+
+        let err = rdr.read_byte_record(&mut rec).unwrap_err();
+        match *err.kind() {
+            ErrorKind::Io(ref ioe) => {
+                assert_eq!(io::ErrorKind::Other, ioe.kind());
+            }
+            ref wrong => panic!("expected I/O error, got {:?}", wrong),
+        }
+        assert!(rdr.is_done());
+        assert!(!rdr.read_byte_record(&mut rec).unwrap());
     }
 }
