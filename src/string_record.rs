@@ -633,7 +633,6 @@ impl StringRecord {
         // clear the record. (It is bad for `record` to contain invalid UTF-8
         // because other accessor methods, like `get`, assume that every field
         // is valid UTF-8.)
-        let pos = rdr.position().clone();
         let read_res = rdr.read_byte_record(&mut self.0);
         let utf8_res = match self.0.validate() {
             Ok(()) => Ok(()),
@@ -646,6 +645,16 @@ impl StringRecord {
         match (read_res, utf8_res) {
             (Err(err), _) => Err(err),
             (Ok(_), Err(err)) => {
+                // The position of this record is the one recorded on the
+                // record itself. When a read is resumed after a `WouldBlock`
+                // interruption, the reader's current position has already
+                // advanced past the start of this record, so it cannot be
+                // used here. (Clearing the record above does not clear its
+                // position.)
+                let pos = match self.0.position() {
+                    Some(pos) => pos.clone(),
+                    None => rdr.position().clone(),
+                };
                 Err(Error::new(ErrorKind::Utf8 { pos: Some(pos), err }))
             }
             (Ok(eof), Ok(())) => Ok(eof),
